@@ -37,7 +37,7 @@ def parse_option():
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum for SGD')
 
     # root folders
-    parser.add_argument('--data-root', type=str, default='./data', help='root directory of dataset')
+    parser.add_argument('--data-root', type=str, default='/misc/lmbssd/marrakch/ILSVRC2015/Data/CLS-LOC/', help='root directory of dataset')
     parser.add_argument('--output-root', type=str, default='./output', help='root directory for output')
 
     # dataset
