@@ -6,6 +6,7 @@ MoCo: Momentum Contrast for Unsupervised Visual Representation Learning
 """
 import argparse
 import os
+import random
 import time
 from pprint import pprint
 
@@ -295,6 +296,7 @@ if __name__ == '__main__':
     if opt.local_rank == 0:
         pprint(vars(opt))
 
+    os.environ['MASTER_PORT'] = str(random.randrange(1000, 5000))
     torch.cuda.set_device(opt.local_rank)
     torch.distributed.init_process_group(backend='nccl', init_method='env://')
     cudnn.benchmark = True
