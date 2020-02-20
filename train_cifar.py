@@ -21,7 +21,7 @@ import torchvision
 from lib.augment.cutout import Cutout
 from lib.augment.autoaugment_extra import CIFAR10Policy
 
-from lib.NCE import MemoryMoCo, NCESoftmaxLoss
+from lib.NCE import MemoryMoCo, NCESoftmaxLoss, ClassOracleMemoryMoCo
 from lib.dataset import ImageFolderInstance
 #from lib.models.resnet import resnet50
 from lib.models.resnet_cifar import ResNet50
@@ -191,7 +191,8 @@ def main(args):
         print(f"length of training dataset: {n_data}")
 
     model, model_ema = build_model(args)
-    contrast = MemoryMoCo(128, args.nce_k, args.nce_t).cuda()
+    # contrast = MemoryMoCo(128, args.nce_k, args.nce_t).cuda()
+    contrast = ClassOracleMemoryMoCo(10, 128, args.nce_k, args.nce_t).cuda()
     criterion = NCESoftmaxLoss().cuda()
     optimizer = torch.optim.SGD(model.parameters(),
                                 lr=args.learning_rate,
@@ -242,7 +243,7 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
     prob_meter = AverageMeter()
 
     end = time.time()
-    for idx, ((x1, x2), _) in enumerate(train_loader):
+    for idx, ((x1, x2), l) in enumerate(train_loader):
         data_time.update(time.time() - end)
 
         #bsz = inputs.size(0)
@@ -262,7 +263,7 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
             feat_k_all, feat_k = DistributedShufle.backward_shuffle(feat_k, backward_inds, return_local=True)
 
         #print ('feat_k: ', feat_k.size(), ' feat_k_all: ', feat_k_all.size(), ' feat_q: ',  feat_q.size())
-        out = contrast(feat_q, feat_k, feat_k_all)
+        out = contrast(feat_q, feat_k, feat_k_all, l)
         loss = criterion(out)
         prob = F.softmax(out, dim=1)[:, 0].mean()
 

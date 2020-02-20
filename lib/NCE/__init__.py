@@ -1,2 +1,2 @@
-from .Contrast import MemoryMoCo
+from .Contrast import MemoryMoCo, ClassOracleMemoryMoCo
 from .NCECriterion import NCESoftmaxLoss
