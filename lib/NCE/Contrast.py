@@ -47,8 +47,8 @@ class ClassOracleMemoryMoCo(MemoryMoCo):
         for i in range(n_classes):
             memory = torch.rand(self.queue_size, feature_dim, requires_grad=False).mul_(2 * stdv).add_(-stdv)
             self.register_buffer('memory_{}'.format(i), memory)
-        print("----- BUFFERS -----")
-        print(self._buffers.keys())
+        # print("----- BUFFERS -----")
+        # print(self._buffers.keys())
         self.register_buffer('memory', torch.tensor([0]))  # "free" up the original memory buffer, not used here
 
     def forward(self, q, k, k_all, q_labels):
@@ -82,13 +82,6 @@ class ClassOracleMemoryMoCo(MemoryMoCo):
             #         print(k_all_idx.mean(dim=-1))
             #         print(out_ids)
             # print("** {}".format(self.memory_0.mean(dim=-1)))
-            #     print(" *** IDX {} *** ".format(i))
-            #     print(k_all_idx.shape)
-            #     print(all_size)
-            #     print(out_ids)
-            #     print(getattr(self, 'memory_{}'.format(i)).shape)
-            #     print(self.index[i])
-            #     print()
 
         return out
 
