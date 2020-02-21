@@ -24,7 +24,7 @@ from lib.augment.autoaugment_extra import CIFAR10Policy
 from lib.NCE import MemoryMoCo, NCESoftmaxLoss, ClassOracleMemoryMoCo
 from lib.dataset import ImageFolderInstance
 #from lib.models.resnet import resnet50
-from lib.models.resnet_cifar import ResNet50
+from lib.models import resnet_cifar
 from lib.models.wrn import wrn
 from lib.util import adjust_learning_rate, AverageMeter, check_dir, DistributedShufle, set_bn_train, moment_update
 
@@ -56,13 +56,14 @@ def parse_option():
                         help='path to latest checkpoint (default: none)')
 
     # model definition
-    parser.add_argument('--model', type=str, default='resnet50', choices=['resnet50'])
+    parser.add_argument('--model', type=str, default='ResNet18', choices=['ResNet18', 'ResNet50'])
     parser.add_argument('--model-width', type=int, default=1, help='width of resnet, eg, 1, 2, 4')
     parser.add_argument('--alpha', type=float, default=0.999, help='exponential moving average weight')
 
     # loss function
     parser.add_argument('--nce-k', type=int, default=512)
     parser.add_argument('--nce-t', type=float, default=0.07)
+    parser.add_argument('--class-oracle', action="store_true")
 
     # misc
     parser.add_argument('--print-freq', type=int, default=10, help='print frequency')
@@ -133,8 +134,8 @@ def get_loader(args):
 
 
 def build_model(args):
-    model = ResNet50().cuda()
-    model_ema = ResNet50().cuda()
+    model = resnet_cifar.__dict__[args.model]().cuda()
+    model_ema = resnet_cifar.__dict__[args.model]().cuda()
 
     #model = wrn().cuda()
     #model_ema = wrn().cuda()
@@ -191,8 +192,10 @@ def main(args):
         print(f"length of training dataset: {n_data}")
 
     model, model_ema = build_model(args)
-    # contrast = MemoryMoCo(128, args.nce_k, args.nce_t).cuda()
-    contrast = ClassOracleMemoryMoCo(10, 128, args.nce_k, args.nce_t).cuda()
+    if not args.class_oracle:
+        contrast = MemoryMoCo(128, args.nce_k, args.nce_t).cuda()
+    else:
+        contrast = ClassOracleMemoryMoCo(10, 128, args.nce_k, args.nce_t).cuda()
     criterion = NCESoftmaxLoss().cuda()
     optimizer = torch.optim.SGD(model.parameters(),
                                 lr=args.learning_rate,
@@ -263,7 +266,10 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
             feat_k_all, feat_k = DistributedShufle.backward_shuffle(feat_k, backward_inds, return_local=True)
 
         #print ('feat_k: ', feat_k.size(), ' feat_k_all: ', feat_k_all.size(), ' feat_q: ',  feat_q.size())
-        out = contrast(feat_q, feat_k, feat_k_all, l)
+        if args.class_oracle:
+            out = contrast(feat_q, feat_k, feat_k_all, l)
+        else:
+            out = contrast(feat_q, feat_k, feat_k_all)
         loss = criterion(out)
         prob = F.softmax(out, dim=1)[:, 0].mean()
 

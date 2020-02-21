@@ -21,7 +21,7 @@ import torchvision
 from lib.augment.cutout import Cutout
 from lib.augment.autoaugment_extra import CIFAR10Policy
 
-from lib.models.resnet_cifar import ResNet50
+from lib.models import resnet_cifar
 from lib.models.wrn import wrn
 from lib.models.LinearModel import LinearClassifierResNet
 from lib.util import adjust_learning_rate, AverageMeter, check_dir, accuracy
@@ -50,6 +50,7 @@ def parse_option():
     parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam')
 
     # model definition
+    parser.add_argument('--model', type=str, default='ResNet18', choices=['ResNet18', 'ResNet50'])
     parser.add_argument('--model-width', type=int, default=1, help='width of resnet, eg, 1, 2, 4')
     parser.add_argument('--layer', type=int, default=6, help='which layer to evaluate')
 
@@ -187,10 +188,17 @@ def main(args):
 
     # create model and optimizer
     #model = resnet50(width=args.model_width).cuda()
-    model = ResNet50().cuda()
+    model = resnet_cifar.__dict__[args.model]().cuda()
     for p in model.parameters():
         p.requires_grad = False
-    classifier = LinearClassifierResNet(args.layer, args.n_label, 'avg', args.model_width).cuda()
+    # classifier = LinearClassifierResNet(args.layer, args.n_label, 'avg', args.model_width).cuda()
+    if args.model == "ResNet18":
+        import torch.nn as nn
+        classifier = nn.Linear(128, 1000).cuda()
+        classifier.weight.data.normal_(0, 0.01)
+        classifier.bias.data.fill_(0.0)
+    else:
+        classifier = LinearClassifierResNet(args.layer, args.n_label, 'avg', args.model_width).cuda()
     classifier = DistributedDataParallel(classifier, device_ids=[args.local_rank], broadcast_buffers=False)
 
     ckpt = torch.load(args.model_path, map_location='cpu')
