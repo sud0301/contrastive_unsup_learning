@@ -6,10 +6,11 @@ MoCo: Momentum Contrast for Unsupervised Visual Representation Learning
 """
 import argparse
 import os
-import random
 import time
 from pprint import pprint
 
+from PIL import Image
+import numpy as np
 import tensorboard_logger as tb_logger
 import torch
 import torch.backends.cudnn as cudnn
@@ -17,6 +18,8 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torchvision import transforms
 import torchvision
+import torchvision.transforms.functional as TF
+import random
 
 from lib.augment.cutout import Cutout
 from lib.augment.autoaugment_extra import CIFAR10Policy
@@ -24,7 +27,7 @@ from lib.augment.autoaugment_extra import CIFAR10Policy
 from lib.NCE import MemoryMoCo, NCESoftmaxLoss
 from lib.dataset import ImageFolderInstance
 #from lib.models.resnet import resnet50
-from lib.models.resnet_cifar import ResNet50
+from lib.models.resnet_cifar import ResNet18
 from lib.models.wrn import wrn
 from lib.util import adjust_learning_rate, AverageMeter, check_dir, DistributedShufle, set_bn_train, moment_update
 
@@ -35,7 +38,7 @@ def parse_option():
                         help='experiment name, used to determine checkpoint/tensorboard dir')
 
     # optimization
-    parser.add_argument('--learning-rate', '--lr', type=float, default=0.01, help='learning rate')
+    parser.add_argument('--learning-rate', '--lr', type=float, default=0.003, help='learning rate')
     parser.add_argument('--lr-decay-epochs', type=int, default=[120, 160, 200], nargs='+',
                         help='where to decay lr, can be a list')
     parser.add_argument('--lr-decay-rate', type=float, default=0.1, help='decay rate for learning rate')
@@ -61,7 +64,7 @@ def parse_option():
     parser.add_argument('--alpha', type=float, default=0.999, help='exponential moving average weight')
 
     # loss function
-    parser.add_argument('--nce-k', type=int, default=512)
+    parser.add_argument('--nce-k', type=int, default=4096)
     parser.add_argument('--nce-t', type=float, default=0.07)
 
     # misc
@@ -69,7 +72,7 @@ def parse_option():
     parser.add_argument('--tb-freq', type=int, default=500, help='tb frequency')
     parser.add_argument('--save-freq', type=int, default=10, help='save frequency')
     parser.add_argument('--batch-size', type=int, default=32, help='batch_size')
-    parser.add_argument('--num-workers', type=int, default=4, help='num of workers to use')
+    parser.add_argument('--num-workers', type=int, default=8, help='num of workers to use')
     parser.add_argument('--epochs', type=int, default=200, help='number of training epochs')
     parser.add_argument('--start-epoch', type=int, default=1, help='used for resume')
     parser.add_argument("--local_rank", type=int)
@@ -83,6 +86,16 @@ def parse_option():
 
     return args
 
+class MyRotationTransform:
+    """Rotate by one of the given angles."""
+
+    def __init__(self, angles):
+        self.angles = angles
+
+    def __call__(self, x):
+        angle = random.choice(self.angles)
+        return TF.rotate(x, angle)
+
 
 class TransformTwice:
     def __init__(self, transform, aug_transform):
@@ -94,18 +107,79 @@ class TransformTwice:
         out2 = self.aug_transform(inp)
         return out1, out2
 
+class RandomTranslateWithReflect:
+    '''
+    Translate image randomly
+    Translate vertically and horizontally by n pixels where
+    n is integer drawn uniformly independently for each axis
+    from [-max_translation, max_translation].
+    Fill the uncovered blank area with reflect padding.
+    '''
+
+    def __init__(self, max_translation):
+        self.max_translation = max_translation
+
+    def __call__(self, old_image):
+        xtranslation, ytranslation = np.random.randint(-self.max_translation,
+                                                       self.max_translation + 1,
+                                                       size=2)
+        xpad, ypad = abs(xtranslation), abs(ytranslation)
+        xsize, ysize = old_image.size
+
+        flipped_lr = old_image.transpose(Image.FLIP_LEFT_RIGHT)
+        flipped_tb = old_image.transpose(Image.FLIP_TOP_BOTTOM)
+        flipped_both = old_image.transpose(Image.ROTATE_180)
+
+        new_image = Image.new("RGB", (xsize + 2 * xpad, ysize + 2 * ypad))
+
+        new_image.paste(old_image, (xpad, ypad))
+
+        new_image.paste(flipped_lr, (xpad + xsize - 1, ypad))
+        new_image.paste(flipped_lr, (xpad - xsize + 1, ypad))
+
+        new_image.paste(flipped_tb, (xpad, ypad + ysize - 1))
+        new_image.paste(flipped_tb, (xpad, ypad - ysize + 1))
+
+        new_image.paste(flipped_both, (xpad - xsize + 1, ypad - ysize + 1))
+        new_image.paste(flipped_both, (xpad + xsize - 1, ypad - ysize + 1))
+        new_image.paste(flipped_both, (xpad - xsize + 1, ypad + ysize - 1))
+        new_image.paste(flipped_both, (xpad + xsize - 1, ypad + ysize - 1))
+
+        new_image = new_image.crop((xpad - xtranslation,
+                                    ypad - ytranslation,
+                                    xpad + xsize - xtranslation,
+                                    ypad + ysize - ytranslation))
+        return new_image
+
 def get_loader(args):
     # set the data loader
     #train_folder = os.path.join(args.data_root, 'train')
 
     #image_size = 224
     normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2471, 0.2435, 0.2616])
+    rotation_transform = MyRotationTransform(angles=[-90, 0, 90, 180])
+
+    #color_jitter = transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
+    #rnd_color_jitter = transforms.RandomApply([color_jitter], p=0.8)
+    #rnd_gray = transforms.RandomGrayscale(p=0.2)
+
+    col_jitter = transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.2)], p=0.8)
+    img_jitter = transforms.RandomApply([RandomTranslateWithReflect(4)], p=0.8)
+    rnd_gray = transforms.RandomGrayscale(p=0.25)
 
     transform_ori = transforms.Compose([
         transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         normalize,
+    ])
+    
+    transform_amdim = transforms.Compose([
+        img_jitter,
+        col_jitter,
+        rnd_gray,
+        transforms.ToTensor(),
+        normalize
     ])
 
     transform_aug = transforms.Compose([
@@ -115,11 +189,14 @@ def get_loader(args):
         transforms.RandomHorizontalFlip(),
         transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
         CIFAR10Policy(),
+        img_jitter,
+        col_jitter,
+        rnd_gray,
         transforms.ToTensor(),
         normalize,
     ])
 
-    transform_train = TransformTwice(transform_ori, transform_aug)
+    transform_train = TransformTwice(transform_aug, transform_aug)
 
     train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
     #train_dataset = ImageFolderInstance(train_folder, transform=train_transform, two_crop=True)
@@ -133,11 +210,8 @@ def get_loader(args):
 
 
 def build_model(args):
-    model = ResNet50().cuda()
-    model_ema = ResNet50().cuda()
-
-    #model = wrn().cuda()
-    #model_ema = wrn().cuda()
+    model = ResNet18().cuda()
+    model_ema = ResNet18().cuda()
 
     # copy weights from `model' to `model_ema'
     moment_update(model, model_ema, 0)
@@ -177,7 +251,7 @@ def save_checkpoint(args, epoch, model, model_ema, contrast, optimizer):
         'epoch': epoch,
     }
     torch.save(state, os.path.join(args.model_folder, 'current.pth'))
-    if epoch % args.save_freq == 0:
+    if epoch % args.save_freq == 0 or epoch ==1:
         torch.save(state, os.path.join(args.model_folder, f'ckpt_epoch_{epoch}.pth'))
     # help release GPU memory
     del state
@@ -213,6 +287,9 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs + 1):
         train_loader.sampler.set_epoch(epoch)
         #adjust_learning_rate(epoch, args, optimizer)
+        
+        if epoch == 1:    
+            save_checkpoint(args, epoch, model, model_ema, contrast, optimizer)
 
         tic = time.time()
         loss, prob = train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optimizer, scheduler, args)

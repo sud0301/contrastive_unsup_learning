@@ -10,6 +10,37 @@ The following enverionments is tested:
 * `pytorch>=1.3, torchvision, cuda=9.2`
 * `tensorboard_logger`: `pip install tensorboard_logger`
 
+
+## Training Momentum Contrast on CIFAR-10
+
+* The pre-training stage:
+
+  ```
+  exp_name=MoCo/ddp/1-gpu_bs-32_shuffle_bn
+  python -m torch.distributed.launch --nproc_per_node=1 \
+      train.py \
+      --batch-size 32 \
+      --exp-name ${exp_name} \
+      --learning-rate 0.03 \
+      --nce-k 4096 \
+      --nce-t 0.3 \
+      --weight-decay 5e-4
+  ```
+
+* The linear evaluation stage:
+
+  ```
+  exp_name=MoCo/ddp/1-gpu_bs-32_shuffle_bn
+  python -m torch.distributed.launch --nproc_per_node=1 \
+      eval.py \
+      --exp-name ${exp_name} \
+      --model-path ./output/imagenet/${exp_name}/models/current.pth \
+      --batch-size 128 \
+      --learning-rate 3 \
+      --epochs 20 \
+      --cosine
+  ```
+
 ## Training Momentum Contrast on ImageNet
 
 * The pre-training stage:
