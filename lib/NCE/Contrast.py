@@ -35,9 +35,20 @@ class MemoryMoCo(nn.Module):
 
         return out
 
+    def forward_eval(self, q, k):
+        k = k.detach()
+        bs = q.shape[0]
+        logits = torch.mm(q, k.t())
+        eye = torch.eye(logits.shape[0]).cuda()
+        l_pos = logits.masked_select(eye==1).view(bs, 1)
+        l_neg = logits.masked_select(eye==0).view(bs, bs-1)
+        out = torch.cat((l_pos, l_neg), dim=1)
+        out = torch.div(out, self.temperature).contiguous()
+        return out
+
 
 class ClassOracleMemoryMoCo(MemoryMoCo):
-    def __init__(self, n_classes, feature_dim, queue_size, temperature=0.07):
+    def __init__(self, n_classes, feature_dim, queue_size, temperature=0.3):
         super().__init__(feature_dim, queue_size, temperature=temperature)
         self.n_classes = n_classes
         self.index = [0]*n_classes
@@ -47,8 +58,7 @@ class ClassOracleMemoryMoCo(MemoryMoCo):
         for i in range(n_classes):
             memory = torch.rand(self.queue_size, feature_dim, requires_grad=False).mul_(2 * stdv).add_(-stdv)
             self.register_buffer('memory_{}'.format(i), memory)
-        # print("----- BUFFERS -----")
-        # print(self._buffers.keys())
+
         self.register_buffer('memory', torch.tensor([0]))  # "free" up the original memory buffer, not used here
 
     def forward(self, q, k, k_all, q_labels):
@@ -65,23 +75,18 @@ class ClassOracleMemoryMoCo(MemoryMoCo):
         out = torch.cat((l_pos, l_neg), dim=1)
         out = torch.div(out, self.temperature).contiguous()
 
-        # print("---------------------------------------------")
-        # print("** {}".format(self.memory_0.mean(dim=-1)))
-
-        # update memory
+        # update memories
+        # print("DBG queues")
         with torch.no_grad():
-            # print("\n---- DBG mem update ----")
             for i in range(self.n_classes):
-                k_all_idx = k_all[q_labels == i, :]
+                # print("mem {}: {}".format(i, getattr(self, 'memory_{}'.format(i)).mean(dim=-1)))
+                k_all_idx = k_all[q_labels != i, :]
                 all_size = k_all_idx.shape[0]
                 out_ids = torch.fmod(torch.arange(all_size, dtype=torch.long).cuda() + self.index[i], self.queue_size)
                 getattr(self, 'memory_{}'.format(i)).index_copy_(0, out_ids, k_all_idx)
                 self.index[i] = (self.index[i] + all_size) % self.queue_size
 
-            #     if i == 0:
-            #         print(k_all_idx.mean(dim=-1))
-            #         print(out_ids)
-            # print("** {}".format(self.memory_0.mean(dim=-1)))
-
         return out
+
+
 

@@ -187,14 +187,13 @@ def main(args):
         print(f"length of training dataset: {len(train_loader.dataset)}")
 
     # create model and optimizer
-    #model = resnet50(width=args.model_width).cuda()
-    model = resnet_cifar.__dict__[args.model]().cuda()
+    model = resnet_cifar.ResNet18().cuda()
     for p in model.parameters():
         p.requires_grad = False
     # classifier = LinearClassifierResNet(args.layer, args.n_label, 'avg', args.model_width).cuda()
     if args.model == "ResNet18":
         import torch.nn as nn
-        classifier = nn.Linear(128, 1000).cuda()
+        classifier = nn.Linear(512, 1000).cuda()
         classifier.weight.data.normal_(0, 0.01)
         classifier.bias.data.fill_(0.0)
     else:
@@ -426,6 +425,8 @@ if __name__ == '__main__':
     if opt.local_rank == 0:
         pprint(vars(opt))
 
+    import random
+    os.environ['MASTER_PORT'] = str(random.randrange(1000, 5000))
     torch.cuda.set_device(opt.local_rank)
     torch.distributed.init_process_group(backend='nccl', init_method='env://')
     cudnn.benchmark = True
