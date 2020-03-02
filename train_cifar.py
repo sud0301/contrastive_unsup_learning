@@ -38,7 +38,7 @@ def parse_option():
                         help='experiment name, used to determine checkpoint/tensorboard dir')
 
     # optimization
-    parser.add_argument('--learning-rate', '--lr', type=float, default=0.003, help='learning rate')
+    parser.add_argument('--learning-rate', '--lr', type=float, default=0.01, help='learning rate')
     parser.add_argument('--lr-decay-epochs', type=int, default=[120, 160, 200], nargs='+',
                         help='where to decay lr, can be a list')
     parser.add_argument('--lr-decay-rate', type=float, default=0.1, help='decay rate for learning rate')
@@ -50,7 +50,7 @@ def parse_option():
     parser.add_argument('--output-root', type=str, default='./output', help='root directory for output')
 
     # dataset
-    parser.add_argument('--dataset', type=str, default='imagenet', choices=['imagenet100', 'imagenet'])
+    parser.add_argument('--dataset', type=str, default='cifar10')
     parser.add_argument('--crop', type=float, default=0.2, help='minimum crop')
     parser.add_argument('--aug', type=str, default='CJ', choices=['NULL', 'CJ'])
 
@@ -67,13 +67,18 @@ def parse_option():
     parser.add_argument('--nce-k', type=int, default=4096)
     parser.add_argument('--nce-t', type=float, default=0.07)
 
+    # supervised options
+    parser.add_argument('--sup-active', action="store_true")
+    parser.add_argument('--sup-n-samples', type=int, default=1000)
+    parser.add_argument('--sup-lr', type=float, default=0.01)
+
     # misc
     parser.add_argument('--print-freq', type=int, default=10, help='print frequency')
     parser.add_argument('--tb-freq', type=int, default=500, help='tb frequency')
     parser.add_argument('--save-freq', type=int, default=10, help='save frequency')
     parser.add_argument('--batch-size', type=int, default=32, help='batch_size')
     parser.add_argument('--num-workers', type=int, default=8, help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=200, help='number of training epochs')
+    parser.add_argument('--epochs', type=int, default=1000, help='number of training epochs')
     parser.add_argument('--start-epoch', type=int, default=1, help='used for resume')
     parser.add_argument("--local_rank", type=int)
 
@@ -206,17 +211,26 @@ def get_loader(args):
         num_workers=args.num_workers, pin_memory=True,
         sampler=train_sampler, drop_last=True)
 
-    return train_loader
+    sup_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_aug)
+    sup_dataset = torch.utils.data.Subset(sup_dataset, torch.randperm(len(sup_dataset))[:args.sup_n_samples])
+    sup_loader = torch.utils.data.DataLoader(
+        sup_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, drop_last=True)
+
+    return train_loader, sup_loader
 
 
 def build_model(args):
     model = ResNet18().cuda()
     model_ema = ResNet18().cuda()
+    print("Built feature extractors")
+    classifier = torch.nn.Linear(128, 10).cuda()
+    print("Built classifier")
 
     # copy weights from `model' to `model_ema'
     moment_update(model, model_ema, 0)
 
-    return model, model_ema
+    return model, model_ema, classifier
 
 
 def load_checkpoint(args, model, model_ema, contrast, optimizer):
@@ -259,18 +273,20 @@ def save_checkpoint(args, epoch, model, model_ema, contrast, optimizer):
 
 
 def main(args):
-    train_loader = get_loader(args)
+    train_loader, sup_loader = get_loader(args)
     n_data = len(train_loader.dataset)
     if args.local_rank == 0:
         print(f"length of training dataset: {n_data}")
 
-    model, model_ema = build_model(args)
+    model, model_ema, classifier = build_model(args)
     contrast = MemoryMoCo(128, args.nce_k, args.nce_t).cuda()
     criterion = NCESoftmaxLoss().cuda()
-    optimizer = torch.optim.SGD(model.parameters(),
+    sup_criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD([{'params': model.parameters()},
+                                 {'params': classifier.parameters(), "lr": args.sup_lr}],
                                 lr=args.learning_rate,
                                 momentum=args.momentum,
-                                weight_decay=args.weight_decay) 
+                                weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs*(n_data/args.batch_size), eta_min=0.0001)
 
     model = DistributedDataParallel(model, device_ids=[args.local_rank], broadcast_buffers=False)
@@ -292,13 +308,14 @@ def main(args):
             save_checkpoint(args, epoch, model, model_ema, contrast, optimizer)
 
         tic = time.time()
-        loss, prob = train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optimizer, scheduler, args)
+        nce_loss, prob, sup_loss = train_moco(epoch, train_loader, sup_loader, model, model_ema, classifier, contrast, criterion, sup_criterion, optimizer, scheduler, args)
 
         if args.local_rank == 0:
             print('epoch {}, total time {:.2f}'.format(epoch, time.time() - tic))
 
             # tensorboard logger
-            logger.log_value('ins_loss', loss, epoch)
+            logger.log_value('nce_loss', nce_loss, epoch)
+            logger.log_value('ce_loss', sup_loss, epoch)
             logger.log_value('ins_prob', prob, epoch)
             logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
@@ -306,7 +323,7 @@ def main(args):
             save_checkpoint(args, epoch, model, model_ema, contrast, optimizer)
 
 
-def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optimizer, scheduler, args):
+def train_moco(epoch, train_loader, sup_loader, model, model_ema, classifier, contrast, criterion, sup_criterion, optimizer, scheduler, args):
     """
     one epoch training for moco
     """
@@ -315,9 +332,11 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
-    loss_meter = AverageMeter()
+    nce_loss_meter = AverageMeter()
+    sup_loss_meter = AverageMeter()
     prob_meter = AverageMeter()
 
+    sup_iter = iter(sup_loader)
     end = time.time()
     for idx, ((x1, x2), _) in enumerate(train_loader):
         data_time.update(time.time() - end)
@@ -340,8 +359,24 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
 
         #print ('feat_k: ', feat_k.size(), ' feat_k_all: ', feat_k_all.size(), ' feat_q: ',  feat_q.size())
         out = contrast(feat_q, feat_k, feat_k_all)
-        loss = criterion(out)
+        nce_loss = criterion(out)
         prob = F.softmax(out, dim=1)[:, 0].mean()
+
+        moment_update(model, model_ema, args.alpha)
+
+        # supervised forward
+        if args.sup_active:
+            try:
+                sup_x, sup_l = next(sup_iter)
+            except StopIteration:
+                sup_iter = iter(sup_loader)  # restart sampling. is this ok?
+                sup_x, sup_l = next(sup_iter)
+            sup_pred = classifier(model(sup_x.cuda()))
+            sup_loss = sup_criterion(sup_pred, sup_l.cuda())
+        else:
+            sup_loss = torch.tensor(0.).cuda()
+
+        loss = nce_loss + sup_loss
 
         # backward
         optimizer.zero_grad()
@@ -349,10 +384,9 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
         optimizer.step()
         scheduler.step()
 
-        moment_update(model, model_ema, args.alpha)
-
         # update meters
-        loss_meter.update(loss.item(), bsz)
+        nce_loss_meter.update(nce_loss.item(), bsz)
+        sup_loss_meter.update(sup_loss.item(), bsz)
         prob_meter.update(prob.item(), bsz)
         batch_time.update(time.time() - end)
         end = time.time()
@@ -362,10 +396,11 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
             print(f'Train: [{epoch}][{idx}/{len(train_loader)}]\t'
                   f'T {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   f'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  f'loss {loss_meter.val:.3f} ({loss_meter.avg:.3f})\t'
+                  f'nce loss {nce_loss_meter.val:.3f} ({nce_loss_meter.avg:.3f})\t'
+                  f'ce loss {sup_loss_meter.val:.3f} ({sup_loss_meter.avg:.3f})\t'
                   f'prob {prob_meter.val:.3f} ({prob_meter.avg:.3f})')
 
-    return loss_meter.avg, prob_meter.avg
+    return nce_loss_meter.avg, prob_meter.avg, sup_loss_meter.avg
 
 
 if __name__ == '__main__':

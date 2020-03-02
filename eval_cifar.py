@@ -21,7 +21,7 @@ import torchvision
 from lib.augment.cutout import Cutout
 from lib.augment.autoaugment_extra import CIFAR10Policy
 
-from lib.models.resnet_cifar import ResNet50
+from lib.models.resnet_cifar import ResNet50, ResNet18
 from lib.models.wrn import wrn
 from lib.models.LinearModel import LinearClassifierResNet
 from lib.util import adjust_learning_rate, AverageMeter, check_dir, accuracy
@@ -33,7 +33,7 @@ def parse_option():
     parser.add_argument('--print-freq', type=int, default=10, help='print frequency')
     parser.add_argument('--tb-freq', type=int, default=500, help='tb frequency')
     parser.add_argument('--save-freq', type=int, default=5, help='save frequency')
-    parser.add_argument('--batch-size', type=int, default=256, help='train batch size')
+    parser.add_argument('--batch-size', type=int, default=128, help='train batch size')
     parser.add_argument('--val-batch-size', type=int, default=256, help='valiate batch size')
     parser.add_argument('--num-workers', type=int, default=8, help='num of workers to use')
     parser.add_argument('--epochs', type=int, default=100, help='number of training epochs')
@@ -187,10 +187,11 @@ def main(args):
 
     # create model and optimizer
     #model = resnet50(width=args.model_width).cuda()
-    model = ResNet50().cuda()
+    model = ResNet18().cuda()
     for p in model.parameters():
         p.requires_grad = False
-    classifier = LinearClassifierResNet(args.layer, args.n_label, 'avg', args.model_width).cuda()
+    # classifier = LinearClassifierResNet(args.layer, args.n_label, 'avg', args.model_width).cuda()
+    classifier = torch.nn.Linear(512, 10).cuda()
     classifier = DistributedDataParallel(classifier, device_ids=[args.local_rank], broadcast_buffers=False)
 
     ckpt = torch.load(args.model_path, map_location='cpu')
