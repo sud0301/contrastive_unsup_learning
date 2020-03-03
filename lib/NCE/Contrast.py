@@ -35,17 +35,105 @@ class MemoryMoCo(nn.Module):
 
         return out
 
+    def forward_eval(self, q, k):
+        k = k.detach()
+        bs = q.shape[0]
+        logits = torch.mm(q, k.t())
+        eye = torch.eye(logits.shape[0]).cuda()
+        l_pos = logits.masked_select(eye==1).view(bs, 1)
+        l_neg = logits.masked_select(eye==0).view(bs, bs-1)
+        out = torch.cat((l_pos, l_neg), dim=1)
+        out = torch.div(out, self.temperature).contiguous()
+        return out
 
-# class MemoryMoCoDIM(MemoryMoCo):
-#     def __init__(self, local_features_size, feature_dim, queue_size, **kwargs):
-#         super().__init__(feature_dim, queue_size, **kwargs)
-#         self.feature_dim = feature_dim
-#         self.local_features_size = local_features_size
-#         stdv = 1. / math.sqrt(self.features_size / 3)
-#         memory = torch.rand(self.queue_size, local_features_size,
-#                             feature_dim, requires_grad=False).mul_(2 * stdv).add_(-stdv)
-#         self.register_buffer('memory', memory)
-#
-#     def forward(self, global_features, local_features):
-#         pass
+
+class ClassOracleMemoryMoCoOLD(MemoryMoCo):
+    """ Implementation using N queues, has a lot of redundancy and mem overhead """
+    def __init__(self, n_classes, feature_dim, queue_size, temperature=0.3):
+        super().__init__(feature_dim, queue_size, temperature=temperature)
+        self.n_classes = n_classes
+        self.index = [0]*n_classes
+
+        # queues
+        stdv = 1. / math.sqrt(feature_dim / 3)
+        for i in range(n_classes):
+            memory = torch.rand(self.queue_size, feature_dim, requires_grad=False).mul_(2 * stdv).add_(-stdv)
+            self.register_buffer('memory_{}'.format(i), memory)
+
+        self.register_buffer('memory', torch.tensor([0]))  # "free" up the original memory buffer, not used here
+
+    def forward(self, q, k, k_all, q_labels):
+        k = k.detach()
+
+        l_pos = (q * k).sum(dim=-1, keepdim=True)  # shape: (batchSize, 1)
+        # TODO: remove clone. need update memory in backwards
+        # TODO (silvio):    iterate over classes instead of over samples? use indexing, but need to change labels.
+        #                   probably it wouldn't get much faster though
+        l_neg = []
+        for sample, label in zip(q, q_labels):
+            l_neg.append(torch.mm(sample.unsqueeze(0), getattr(self, 'memory_{}'.format(label)).clone().detach().t()))
+        l_neg = torch.cat(l_neg, dim=0)
+        out = torch.cat((l_pos, l_neg), dim=1)
+        out = torch.div(out, self.temperature).contiguous()
+
+        # update memories
+        # print("DBG queues")
+        with torch.no_grad():
+            for i in range(self.n_classes):
+                # print("mem {}: {}".format(i, getattr(self, 'memory_{}'.format(i)).mean(dim=-1)))
+                k_all_idx = k_all[q_labels != i, :]
+                all_size = k_all_idx.shape[0]
+                out_ids = torch.fmod(torch.arange(all_size, dtype=torch.long).cuda() + self.index[i], self.queue_size)
+                getattr(self, 'memory_{}'.format(i)).index_copy_(0, out_ids, k_all_idx)
+                self.index[i] = (self.index[i] + all_size) % self.queue_size
+
+        return out
+
+
+class ClassOracleMemoryMoCo(MemoryMoCo):
+    def __init__(self, n_classes, feature_dim, queue_size, temperature=0.3):
+        super().__init__(feature_dim, queue_size, temperature=temperature)
+        self.n_classes = n_classes
+
+        labels = torch.ones(self.queue_size, dtype=torch.long) * (-1)
+        self.register_buffer('labels', labels)
+        self.min_hist = []
+
+    def forward(self, q, k, k_all, q_labels):
+        k = k.detach()
+
+        l_pos = (q * k).sum(dim=-1, keepdim=True)  # shape: (batchSize, 1)
+        # TODO: remove clone. need update memory in backwards
+        # TODO (silvio):    iterate over classes instead of over samples? use indexing, but need to change labels.
+        #                   probably it wouldn't get much faster though
+        l_neg = []
+
+        # for sample, label in zip(q, q_labels):
+        #     l_neg.append(torch.mm(sample.unsqueeze(0), self.memory[self.labels != label].clone().detach().t()))
+
+        tmp_mem = self.memory.clone().detach()
+        for sample, label in zip(q, q_labels):
+            l_neg.append(torch.mm(sample.unsqueeze(0), tmp_mem[self.labels != label].t()))
+
+        # self.min_hist.append(min([e.shape[1] for e in l_neg]))
+        # if len(self.min_hist)>=100:
+        #     self.min_hist = self.min_hist[90:]
+        # print("min_hist: {}".format(sum(self.min_hist)/len(self.min_hist)))
+        #
+        l_neg = [e[:, :min([e.shape[1] for e in l_neg])] for e in l_neg]
+        l_neg = torch.cat(l_neg, dim=0)
+        out = torch.cat((l_pos, l_neg), dim=1)
+        out = torch.div(out, self.temperature).contiguous()
+
+        # update memories
+        # print("DBG queues")
+        with torch.no_grad():
+            all_size = k_all.shape[0]
+            out_ids = torch.fmod(torch.arange(all_size, dtype=torch.long).cuda() + self.index, self.queue_size)
+            self.memory.index_copy_(0, out_ids, k_all)
+            self.labels.index_copy_(0, out_ids, q_labels)
+            self.index = (self.index + all_size) % self.queue_size
+
+        return out
+
 
