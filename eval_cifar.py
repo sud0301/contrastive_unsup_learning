@@ -83,7 +83,9 @@ def parse_option():
 
     args = parser.parse_args()
 
-    output_dir = check_dir(os.path.join(args.output_root, args.dataset, args.exp_name))
+    epoch = "".join([s for s in os.path.basename(args.model_path) if s.isdigit()])
+    output_dir = check_dir(os.path.join(args.output_root, args.dataset, args.exp_name, "linear_epoch_{}".format(epoch)))
+    # output_dir = check_dir(os.path.join(args.output_root, args.dataset, args.exp_name))
     args.model_folder = check_dir(os.path.join(output_dir, 'linear_models'))
     args.tb_folder = check_dir(os.path.join(output_dir, 'linear_tensorboard'))
 
