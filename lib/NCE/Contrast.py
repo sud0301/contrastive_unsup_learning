@@ -47,7 +47,8 @@ class MemoryMoCo(nn.Module):
         return out
 
 
-class ClassOracleMemoryMoCo(MemoryMoCo):
+class ClassOracleMemoryMoCoOLD(MemoryMoCo):
+    """ Implementation using N queues, has a lot of redundancy and mem overhead """
     def __init__(self, n_classes, feature_dim, queue_size, temperature=0.3):
         super().__init__(feature_dim, queue_size, temperature=temperature)
         self.n_classes = n_classes
@@ -88,5 +89,46 @@ class ClassOracleMemoryMoCo(MemoryMoCo):
 
         return out
 
+
+class ClassOracleMemoryMoCo(MemoryMoCo):
+    def __init__(self, n_classes, feature_dim, queue_size, temperature=0.3):
+        super().__init__(feature_dim, queue_size, temperature=temperature)
+        self.n_classes = n_classes
+
+        labels = torch.ones(self.queue_size, dtype=torch.long) * (-1)
+        self.register_buffer('labels', labels)
+        self.min_hist = []
+
+    def forward(self, q, k, k_all, q_labels):
+        k = k.detach()
+
+        l_pos = (q * k).sum(dim=-1, keepdim=True)  # shape: (batchSize, 1)
+        # TODO: remove clone. need update memory in backwards
+        # TODO (silvio):    iterate over classes instead of over samples? use indexing, but need to change labels.
+        #                   probably it wouldn't get much faster though
+        l_neg = []
+        for sample, label in zip(q, q_labels):
+            l_neg.append(torch.mm(sample.unsqueeze(0), self.memory[self.labels != label].clone().detach().t()))
+
+        self.min_hist.append(min([e.shape[1] for e in l_neg]))
+        if len(self.min_hist)>=100:
+            self.min_hist = self.min_hist[90:]
+        print("min_hist: {}".format(sum(self.min_hist)/len(self.min_hist)))
+
+        l_neg = [e[:, :min([e.shape[1] for e in l_neg])] for e in l_neg]
+        l_neg = torch.cat(l_neg, dim=0)
+        out = torch.cat((l_pos, l_neg), dim=1)
+        out = torch.div(out, self.temperature).contiguous()
+
+        # update memories
+        # print("DBG queues")
+        with torch.no_grad():
+            all_size = k_all.shape[0]
+            out_ids = torch.fmod(torch.arange(all_size, dtype=torch.long).cuda() + self.index, self.queue_size)
+            self.memory.index_copy_(0, out_ids, k_all)
+            self.labels.index_copy_(0, out_ids, q_labels)
+            self.index = (self.index + all_size) % self.queue_size
+
+        return out
 
 

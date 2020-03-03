@@ -336,6 +336,7 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
         x2.contiguous()
         x1 = x1.cuda(non_blocking=True)
         x2 = x2.cuda(non_blocking=True)
+        l = l.cuda()
 
         feat_q = model(x1)
         with torch.no_grad():
