@@ -34,3 +34,18 @@ class MemoryMoCo(nn.Module):
             self.index = (self.index + all_size) % self.queue_size
 
         return out
+
+
+# class MemoryMoCoDIM(MemoryMoCo):
+#     def __init__(self, local_features_size, feature_dim, queue_size, **kwargs):
+#         super().__init__(feature_dim, queue_size, **kwargs)
+#         self.feature_dim = feature_dim
+#         self.local_features_size = local_features_size
+#         stdv = 1. / math.sqrt(self.features_size / 3)
+#         memory = torch.rand(self.queue_size, local_features_size,
+#                             feature_dim, requires_grad=False).mul_(2 * stdv).add_(-stdv)
+#         self.register_buffer('memory', memory)
+#
+#     def forward(self, global_features, local_features):
+#         pass
+

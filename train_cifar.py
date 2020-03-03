@@ -69,8 +69,9 @@ def parse_option():
 
     # supervised options
     parser.add_argument('--sup-active', action="store_true")
-    parser.add_argument('--sup-n-samples', type=int, default=1000)
+    parser.add_argument('--sup-n-samples', type=int, default=250)
     parser.add_argument('--sup-lr', type=float, default=0.01)
+    parser.add_argument('--sup-rate', type=float, default=1)
 
     # misc
     parser.add_argument('--print-freq', type=int, default=10, help='print frequency')
@@ -90,6 +91,7 @@ def parse_option():
     args.tb_folder = check_dir(os.path.join(output_dir, 'tensorboard'))
 
     return args
+
 
 class MyRotationTransform:
     """Rotate by one of the given angles."""
@@ -278,6 +280,7 @@ def main(args):
     if args.local_rank == 0:
         print(f"length of training dataset: {n_data}")
 
+    open(os.path.join(args.tb_folder, os.environ.pop("PBS_JOBID", "dbg")), "a").close()
     model, model_ema, classifier = build_model(args)
     contrast = MemoryMoCo(128, args.nce_k, args.nce_t).cuda()
     criterion = NCESoftmaxLoss().cuda()
@@ -376,7 +379,7 @@ def train_moco(epoch, train_loader, sup_loader, model, model_ema, classifier, co
         else:
             sup_loss = torch.tensor(0.).cuda()
 
-        loss = nce_loss + sup_loss
+        loss = nce_loss*(1-args.sup_rate) + sup_loss*args.sup_rate
 
         # backward
         optimizer.zero_grad()

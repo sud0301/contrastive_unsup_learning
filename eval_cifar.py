@@ -82,7 +82,8 @@ def parse_option():
 
     args = parser.parse_args()
 
-    output_dir = check_dir(os.path.join(args.output_root, args.dataset, args.exp_name))
+    epoch = "".join([s for s in os.path.basename(args.model_path) if s.isdigit()])
+    output_dir = check_dir(os.path.join(args.output_root, args.dataset, args.exp_name, "linear_epoch_{}".format(epoch)))
     args.model_folder = check_dir(os.path.join(output_dir, 'linear_models'))
     args.tb_folder = check_dir(os.path.join(output_dir, 'linear_tensorboard'))
 
@@ -185,6 +186,7 @@ def main(args):
     if args.local_rank == 0:
         print(f"length of training dataset: {len(train_loader.dataset)}")
 
+    open(os.path.join(args.tb_folder, os.environ.pop("PBS_JOBID", "dbg")), "a").close()
     # create model and optimizer
     #model = resnet50(width=args.model_width).cuda()
     model = ResNet18().cuda()
@@ -415,10 +417,12 @@ def validate(val_loader, model, classifier, criterion, args):
 
 
 if __name__ == '__main__':
+    import random
     opt = parse_option()
     if opt.local_rank == 0:
         pprint(vars(opt))
 
+    os.environ['MASTER_PORT'] = str(random.randrange(1000, 5000))
     torch.cuda.set_device(opt.local_rank)
     torch.distributed.init_process_group(backend='nccl', init_method='env://')
     cudnn.benchmark = True
