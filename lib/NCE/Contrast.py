@@ -107,14 +107,19 @@ class ClassOracleMemoryMoCo(MemoryMoCo):
         # TODO (silvio):    iterate over classes instead of over samples? use indexing, but need to change labels.
         #                   probably it wouldn't get much faster though
         l_neg = []
+
+        # for sample, label in zip(q, q_labels):
+        #     l_neg.append(torch.mm(sample.unsqueeze(0), self.memory[self.labels != label].clone().detach().t()))
+
+        tmp_mem = self.memory.clone().detach()
         for sample, label in zip(q, q_labels):
-            l_neg.append(torch.mm(sample.unsqueeze(0), self.memory[self.labels != label].clone().detach().t()))
+            l_neg.append(torch.mm(sample.unsqueeze(0), tmp_mem[self.labels != label].t()))
 
-        self.min_hist.append(min([e.shape[1] for e in l_neg]))
-        if len(self.min_hist)>=100:
-            self.min_hist = self.min_hist[90:]
-        print("min_hist: {}".format(sum(self.min_hist)/len(self.min_hist)))
-
+        # self.min_hist.append(min([e.shape[1] for e in l_neg]))
+        # if len(self.min_hist)>=100:
+        #     self.min_hist = self.min_hist[90:]
+        # print("min_hist: {}".format(sum(self.min_hist)/len(self.min_hist)))
+        #
         l_neg = [e[:, :min([e.shape[1] for e in l_neg])] for e in l_neg]
         l_neg = torch.cat(l_neg, dim=0)
         out = torch.cat((l_pos, l_neg), dim=1)
