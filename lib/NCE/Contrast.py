@@ -90,7 +90,7 @@ class ClassOracleMemoryMoCoOLD(MemoryMoCo):
         return out
 
 
-class ClassOracleMemoryMoCo(MemoryMoCo):
+class ProxyClassOracleMemoryMoCo(MemoryMoCo):
     def __init__(self, n_classes, feature_dim, queue_size, temperature=0.3):
         super().__init__(feature_dim, queue_size, temperature=temperature)
         self.n_classes = n_classes
@@ -113,7 +113,11 @@ class ClassOracleMemoryMoCo(MemoryMoCo):
 
         tmp_mem = self.memory.clone().detach()
         for sample, label in zip(q, q_labels):
-            l_neg.append(torch.mm(sample.unsqueeze(0), tmp_mem[self.labels != label].t()))
+            # if we don't know the label we use all the negatives, else we use the label info to select them
+            if label == -1:
+                l_neg.append(torch.mm(sample.unsqueeze(0), tmp_mem.t()))
+            else:
+                l_neg.append(torch.mm(sample.unsqueeze(0), tmp_mem[self.labels != label].t()))
 
         # self.min_hist.append(min([e.shape[1] for e in l_neg]))
         # if len(self.min_hist)>=100:

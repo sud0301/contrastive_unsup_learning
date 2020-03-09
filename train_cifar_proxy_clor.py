@@ -24,7 +24,7 @@ import random
 from lib.augment.cutout import Cutout
 from lib.augment.autoaugment_extra import CIFAR10Policy
 
-from lib.NCE import MemoryMoCo, NCESoftmaxLoss
+from lib.NCE import MemoryMoCo, NCESoftmaxLoss, ProxyClassOracleMemoryMoCo
 from lib.dataset import ImageFolderInstance
 #from lib.models.resnet import resnet50
 from lib.models.resnet_cifar import ResNet18
@@ -68,11 +68,12 @@ def parse_option():
     parser.add_argument('--nce-t', type=float, default=0.07)
 
     # supervised options
-    parser.add_argument('--sup-active', action="store_true")
     parser.add_argument('--sup-n-samples', type=int, default=250)
-    parser.add_argument('--sup-lr', type=float, default=None)
-    parser.add_argument('--sup-bs', type=int, default=None)
+    parser.add_argument('--sup-lr', type=float, default=0.01)
     parser.add_argument('--sup-rate', type=float, default=0.3)
+    parser.add_argument("--sup-head-only", action="store_true")
+    parser.add_argument('--sup-bs', type=int, default=None)
+    parser.add_argument('--proxy-threshold', type=float, default=0.5)
 
     # misc
     parser.add_argument('--print-freq', type=int, default=10, help='print frequency')
@@ -300,7 +301,7 @@ def main(args):
 
     open(os.path.join(args.tb_folder, os.environ.pop("PBS_JOBID", "dbg")), "a").close()
     model, model_ema, classifier = build_model(args)
-    contrast = MemoryMoCo(128, args.nce_k, args.nce_t).cuda()
+    contrast = ProxyClassOracleMemoryMoCo(10, 128, args.nce_k, temperature=args.nce_t).cuda()
     criterion = NCESoftmaxLoss().cuda()
     sup_criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD([{'params': model.parameters()},
@@ -329,7 +330,9 @@ def main(args):
             save_checkpoint(args, epoch, model, model_ema, contrast, optimizer)
 
         tic = time.time()
-        nce_loss, prob, sup_loss = train_moco(epoch, train_loader, sup_loader, model, model_ema, classifier, contrast, criterion, sup_criterion, optimizer, scheduler, args)
+        nce_loss, prob, sup_loss, percent_proxy = train_moco(epoch, train_loader, sup_loader, model, model_ema,
+                                                             classifier, contrast, criterion, sup_criterion,
+                                                             optimizer, scheduler, args)
 
         if args.local_rank == 0:
             print('epoch {}, total time {:.2f}'.format(epoch, time.time() - tic))
@@ -339,6 +342,7 @@ def main(args):
             logger.log_value('ce_loss', sup_loss, epoch)
             logger.log_value('ins_prob', prob, epoch)
             logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
+            logger.log_value('percent_proxy_labels', percent_proxy, epoch)
 
             # save model
             save_checkpoint(args, epoch, model, model_ema, contrast, optimizer)
@@ -357,6 +361,9 @@ def train_moco(epoch, train_loader, sup_loader, model, model_ema, classifier, co
     sup_loss_meter = AverageMeter()
     prob_meter = AverageMeter()
 
+    # dbg meters
+    percent_proxy_meter = AverageMeter()
+
     sup_iter = iter(sup_loader)
     end = time.time()
     for idx, ((x1, x2), _) in enumerate(train_loader):
@@ -374,28 +381,34 @@ def train_moco(epoch, train_loader, sup_loader, model, model_ema, classifier, co
 
         feat_q = model(x1)
         with torch.no_grad():
-            x2_shuffled, backward_inds = DistributedShufle.forward_shuffle(x2, epoch)
-            feat_k = model_ema(x2_shuffled)
-            feat_k_all, feat_k = DistributedShufle.backward_shuffle(feat_k, backward_inds, return_local=True)
+            # x2_shuffled, backward_inds = DistributedShufle.forward_shuffle(x2, epoch)
+            # feat_k = model_ema(x2_shuffled)
+            # feat_k_all, feat_k = DistributedShufle.backward_shuffle(feat_k, backward_inds, return_local=True)
+            feat_k = model_ema(x2)
 
-        #print ('feat_k: ', feat_k.size(), ' feat_k_all: ', feat_k_all.size(), ' feat_q: ',  feat_q.size())
-        out = contrast(feat_q, feat_k, feat_k_all)
+        # classifier/proxy forward
+        try:
+            (sup_x1, sup_x2), sup_l = next(sup_iter)
+        except StopIteration:
+            sup_iter = iter(sup_loader)  # restart sampling. is this ok?
+            (sup_x1, sup_x2), sup_l = next(sup_iter)
+        cls_feat = model(sup_x1.cuda())
+        if args.sup_head_only:
+            cls_feat = cls_feat.detach()
+        sup_pred = classifier(cls_feat)
+        sup_loss = sup_criterion(sup_pred, sup_l.cuda())
+
+        proxy_labels = sup_pred.argmax(dim=-1)
+        # print()
+        # print(proxy_labels)
+        # print(sup_pred.softmax(dim=-1).max(dim=-1)[0])
+        proxy_labels[sup_pred.softmax(dim=-1).max(dim=-1)[0] < args.proxy_threshold] = -1.
+        # print(proxy_labels)
+
+        # print ('feat_k: ', feat_k.size(), ' feat_k_all: ', feat_k_all.size(), ' feat_q: ',  feat_q.size())
+        out = contrast(feat_q, feat_k, feat_k, proxy_labels)
         nce_loss = criterion(out)
         prob = F.softmax(out, dim=1)[:, 0].mean()
-
-        moment_update(model, model_ema, args.alpha)
-
-        # supervised forward
-        if args.sup_active:
-            try:
-                (sup_x1, sup_x2), sup_l = next(sup_iter)
-            except StopIteration:
-                sup_iter = iter(sup_loader)  # restart sampling. is this ok?
-                (sup_x1, sup_x2), sup_l = next(sup_iter)
-            sup_pred = classifier(model(sup_x1.cuda()))
-            sup_loss = sup_criterion(sup_pred, sup_l.cuda())
-        else:
-            sup_loss = torch.tensor(0.).cuda()
 
         loss = nce_loss*(1-args.sup_rate) + sup_loss*args.sup_rate
 
@@ -405,10 +418,13 @@ def train_moco(epoch, train_loader, sup_loader, model, model_ema, classifier, co
         optimizer.step()
         scheduler.step()
 
+        moment_update(model, model_ema, args.alpha)
+
         # update meters
         nce_loss_meter.update(nce_loss.item(), bsz)
         sup_loss_meter.update(sup_loss.item(), bsz)
         prob_meter.update(prob.item(), bsz)
+        percent_proxy_meter.update((proxy_labels != -1).float().mean().item())
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -419,9 +435,10 @@ def train_moco(epoch, train_loader, sup_loader, model, model_ema, classifier, co
                   f'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   f'nce loss {nce_loss_meter.val:.3f} ({nce_loss_meter.avg:.3f})\t'
                   f'ce loss {sup_loss_meter.val:.3f} ({sup_loss_meter.avg:.3f})\t'
-                  f'prob {prob_meter.val:.3f} ({prob_meter.avg:.3f})')
+                  f'prob {prob_meter.val:.3f} ({prob_meter.avg:.3f})\t'
+                  f'percent proxies {percent_proxy_meter.val:.3f} {percent_proxy_meter.avg:.3f}')
 
-    return nce_loss_meter.avg, prob_meter.avg, sup_loss_meter.avg
+    return nce_loss_meter.avg, prob_meter.avg, sup_loss_meter.avg, percent_proxy_meter.avg
 
 
 if __name__ == '__main__':
