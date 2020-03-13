@@ -7,6 +7,7 @@ MoCo: Momentum Contrast for Unsupervised Visual Representation Learning
 import argparse
 import os
 import time
+import json
 from pprint import pprint
 
 from PIL import Image
@@ -17,7 +18,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torchvision import transforms
-import torchvision
+from torchvision.datasets import CIFAR10, SVHN
 import torchvision.transforms.functional as TF
 import random
 
@@ -35,7 +36,7 @@ from anomaly_tools.data.images.cifar10 import CIFAR10ClassSelect
 from sklearn.metrics import roc_auc_score
 
 def parse_option():
-    parser = argparse.ArgumentParser('argument for training')
+    parser = argparse.ArgumentParser('argument for training', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     # exp name
     parser.add_argument('--exp-name', type=str, default='exp',
                         help='experiment name, used to determine checkpoint/tensorboard dir')
@@ -50,7 +51,9 @@ def parse_option():
 
     # root folders
     parser.add_argument('--data-root', type=str, default='./data', help='root directory of dataset')
-    parser.add_argument('--output-root', type=str, default='./output', help='root directory for output')
+    parser.add_argument('--output-root', type=str,
+                        default='/misc/lmbraid18/galessos/experiments/contrastive_unsup_learning/output',
+                        help='root directory for output')
 
     # dataset
     parser.add_argument('--dataset', type=str, default='cifar10_357')
@@ -112,6 +115,7 @@ class TransformTwice:
         out2 = self.aug_transform(inp)
         return out1, out2
 
+
 class RandomTranslateWithReflect:
     '''
     Translate image randomly
@@ -157,39 +161,133 @@ class RandomTranslateWithReflect:
         return new_image
 
 
-def get_ood_loaders(args):
-    train_transform = transforms.Compose([transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
-                                          transforms.RandomHorizontalFlip(),
-                                          transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.2)], p=0.8),
-                                          transforms.RandomGrayscale(p=0.25),
-                                          transforms.ToTensor(),
-                                          transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-                                                               std=[0.2471, 0.2435, 0.2616])])
-    val_transform = transforms.Compose([transforms.ToTensor(),
-                                        transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-                                                             std=[0.2471, 0.2435, 0.2616])])
+def get_cifar_ids(dataset, classes, name):
+    idsfile = "{}.csv".format(name)
+    if not os.path.isfile(idsfile):
+        print("Finding indices for "+name+"...")
+        ids = [i for i, (_, l) in enumerate(dataset) if l in classes]
+        # write ids to json for future use and return
+        with open(idsfile, "w") as jsf:
+            json.dump(ids, jsf)
+        return ids
+    # load json
+    print("Found indices for " + name + ", loading...")
+    with open(idsfile) as jsf:
+        ids = json.load(jsf)
+    return ids
 
-    train_transform = TransformTwice(train_transform, train_transform)
-    val_transform = TransformTwice(val_transform, val_transform)
+
+train_transform = transforms.Compose([transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
+                                      transforms.RandomHorizontalFlip(),
+                                      transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.2)], p=0.8),
+                                      transforms.RandomGrayscale(p=0.25),
+                                      transforms.ToTensor(),
+                                      transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                                                           std=[0.2471, 0.2435, 0.2616])])
+val_transform = transforms.Compose([transforms.ToTensor(),
+                                    transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                                                         std=[0.2471, 0.2435, 0.2616])])
+
+train_transform = TransformTwice(train_transform, train_transform)
+val_transform = TransformTwice(val_transform, val_transform)
+
+
+# def get_ood_loaders(args):
+#     train_transform = transforms.Compose([transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
+#                                           transforms.RandomHorizontalFlip(),
+#                                           transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.2)], p=0.8),
+#                                           transforms.RandomGrayscale(p=0.25),
+#                                           transforms.ToTensor(),
+#                                           transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+#                                                                std=[0.2471, 0.2435, 0.2616])])
+#     val_transform = transforms.Compose([transforms.ToTensor(),
+#                                         transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+#                                                              std=[0.2471, 0.2435, 0.2616])])
+#
+#     train_transform = TransformTwice(train_transform, train_transform)
+#     val_transform = TransformTwice(val_transform, val_transform)
+#
+#     if args.dataset == 'svhn':
+#         from torchvision.datasets import CIFAR10, SVHN
+#         train_in_data = CIFAR10('./data', train=True, transform=train_transform, download=True)
+#         val_in_data = CIFAR10('./data', train=False, transform=val_transform, download=True)
+#         val_out_data = SVHN('./data', split='test', transform=val_transform, download=True)
+#
+#     elif 'cifar10_' in args.dataset:
+#         if args.dataset == "cifar10_animals":
+#             positive_classes = [2, 3, 4, 5, 6, 7]
+#         else:
+#             positive_classes = [int(d) for d in args.dataset.replace('cifar10_', '')]
+#         negative_classes = [c for c in list(range(10)) if c not in positive_classes]
+#         train_in_data = CIFAR10ClassSelect(root='./data', positive_classes=positive_classes, train=True,
+#                                            download=False, transform=train_transform)
+#         val_in_data = CIFAR10ClassSelect(root='./data', positive_classes=positive_classes, train=False,
+#                                          download=False, transform=val_transform)
+#         val_out_data = CIFAR10ClassSelect(root='./data', positive_classes=negative_classes, train=False,
+#                                           download=False, transform=val_transform)
+#     else:
+#         raise NotImplementedError
+#
+#     train_sampler = torch.utils.data.distributed.DistributedSampler(train_in_data)
+#     train_loader = torch.utils.data.DataLoader(
+#         train_in_data, batch_size=args.batch_size, shuffle=False,
+#         num_workers=args.num_workers, pin_memory=True,
+#         sampler=train_sampler, drop_last=True)
+#
+#     in_val_sampler = torch.utils.data.distributed.DistributedSampler(val_in_data)
+#     in_val_loader = torch.utils.data.DataLoader(
+#         val_in_data, batch_size=64, shuffle=False,
+#         num_workers=args.num_workers, pin_memory=True,
+#         sampler=in_val_sampler, drop_last=True)
+#
+#     out_val_sampler = torch.utils.data.distributed.DistributedSampler(val_out_data)
+#     out_val_loader = torch.utils.data.DataLoader(
+#         val_out_data, batch_size=64, shuffle=False,
+#         num_workers=args.num_workers, pin_memory=True,
+#         sampler=out_val_sampler, drop_last=True)
+#
+#     return train_loader, in_val_loader, out_val_loader
+
+
+def get_ood_loaders(args):
+    # train_transform = transforms.Compose([transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
+    #                                       transforms.RandomHorizontalFlip(),
+    #                                       transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.2)], p=0.8),
+    #                                       transforms.RandomGrayscale(p=0.25),
+    #                                       transforms.Resize(64),
+    #                                       transforms.ToTensor(),
+    #                                       transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+    #                                                            std=[0.2471, 0.2435, 0.2616])])
+    # val_transform = transforms.Compose([transforms.Resize(64),
+    #                                     transforms.ToTensor(),
+    #                                     transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+    #                                                          std=[0.2471, 0.2435, 0.2616])])
+
+    # train_transform = TransformTwice(train_transform, train_transform)
+    # val_transform = TransformTwice(val_transform, val_transform)
 
     if args.dataset == 'svhn':
-        from torchvision.datasets import CIFAR10, SVHN
-        train_in_data = CIFAR10('./data', train=True, transform=train_transform, download=True)
-        val_in_data = CIFAR10('./data', train=False, transform=val_transform, download=True)
-        val_out_data = SVHN('./data', split='test', transform=val_transform, download=True)
+        train_in_data = CIFAR10('./tmp_datasets', train=True, transform=train_transform, download=True)
+        val_in_data = CIFAR10('./tmp_datasets', train=False, transform=val_transform, download=True)
+        val_out_data = SVHN('./tmp_datasets', split='test', transform=val_transform, download=True)
 
     elif 'cifar10_' in args.dataset:
+        train_dataset = CIFAR10('./tmp_datasets', train=True, transform=train_transform, download=True)
+        val_dataset = CIFAR10('./tmp_datasets', train=False, transform=val_transform, download=True)
         if args.dataset == "cifar10_animals":
             positive_classes = [2, 3, 4, 5, 6, 7]
         else:
             positive_classes = [int(d) for d in args.dataset.replace('cifar10_', '')]
         negative_classes = [c for c in list(range(10)) if c not in positive_classes]
-        train_in_data = CIFAR10ClassSelect(root='./data', positive_classes=positive_classes, train=True,
-                                           download=False, transform=train_transform)
-        val_in_data = CIFAR10ClassSelect(root='./data', positive_classes=positive_classes, train=False,
-                                         download=False, transform=val_transform)
-        val_out_data = CIFAR10ClassSelect(root='./data', positive_classes=negative_classes, train=False,
-                                          download=False, transform=val_transform)
+
+        train_ids = get_cifar_ids(train_dataset, positive_classes, args.dataset+"_train_in")
+        val_in_ids = get_cifar_ids(val_dataset, positive_classes, args.dataset+"_val_in")
+        val_out_ids = get_cifar_ids(val_dataset, negative_classes, args.dataset+"_val_out")
+
+        train_in_data = torch.utils.data.Subset(train_dataset, train_ids)
+        val_in_data = torch.utils.data.Subset(val_dataset, val_in_ids)
+        val_out_data = torch.utils.data.Subset(val_dataset, val_out_ids)
+
     else:
         raise NotImplementedError
 
@@ -214,70 +312,12 @@ def get_ood_loaders(args):
     return train_loader, in_val_loader, out_val_loader
 
 
-def get_loader(args):
-    normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2471, 0.2435, 0.2616])
-
-    col_jitter = transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.2)], p=0.8)
-    img_jitter = transforms.RandomApply([RandomTranslateWithReflect(4)], p=0.8)
-    rnd_gray = transforms.RandomGrayscale(p=0.25)
-
-    transform_aug = transforms.Compose([
-        transforms.ToTensor(),
-        Cutout(n_holes=1, length=16),
-        transforms.ToPILImage(),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
-        CIFAR10Policy(),
-        img_jitter,
-        col_jitter,
-        rnd_gray,
-        transforms.ToTensor(),
-        normalize,
-    ])
-
-    transform_train = TransformTwice(transform_aug, transform_aug)
-    transform_val = TransformTwice(transforms.Compose([transforms.ToTensor(), normalize]),
-                                   transforms.Compose([transforms.ToTensor(), normalize]))
-
-    if args.dataset == 'cifar10_animals':
-        positive_classes = [2, 3, 4, 5, 6, 7]
-    elif "cifar10_" in args.dataset:
-        positive_classes = [int(d) for d in args.dataset.replace('cifar10_', '')]
-    else:
-        raise NotImplementedError
-    negative_classes = [c for c in list(range(10)) if c not in positive_classes]
-    print("OOD detection on CIFAR10. Positive classes: ".format(positive_classes))
-    train_dataset = CIFAR10ClassSelect(root='./data', positive_classes=positive_classes, train=True,
-                                       download=False, transform=transform_train)
-    in_val_dataset = CIFAR10ClassSelect(root='./data', positive_classes=positive_classes, train=False,
-                                        download=False, transform=transform_val)
-    out_val_dataset = CIFAR10ClassSelect(root='./data', positive_classes=negative_classes, train=False,
-                                         download=False, transform=transform_val)
-
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
-        sampler=train_sampler, drop_last=True)
-
-    in_val_sampler = torch.utils.data.distributed.DistributedSampler(in_val_dataset)
-    in_val_loader = torch.utils.data.DataLoader(
-        in_val_dataset, batch_size=64, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
-        sampler=in_val_sampler, drop_last=True)
-
-    out_val_sampler = torch.utils.data.distributed.DistributedSampler(out_val_dataset)
-    out_val_loader = torch.utils.data.DataLoader(
-        out_val_dataset, batch_size=64, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
-        sampler=out_val_sampler, drop_last=True)
-
-    return train_loader, in_val_loader, out_val_loader
-
-
 def build_model(args):
+    from torchvision.models.resnet import resnet18
     model = ResNet18().cuda()
     model_ema = ResNet18().cuda()
+    # model = resnet18(pretrained=False, num_classes=128).cuda()
+    # model_ema = resnet18(pretrained=False, num_classes=128).cuda()
 
     # copy weights from `model' to `model_ema'
     moment_update(model, model_ema, 0)
