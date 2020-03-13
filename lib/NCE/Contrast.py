@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 import math
+from ..models.resnet_cifar import ResNet18
+from ..util import moment_update
 
 
 class MemoryMoCo(nn.Module):
@@ -61,29 +63,18 @@ class ClassOracleMemoryMoCo(MemoryMoCo):
 
         l_pos = (q * k).sum(dim=-1, keepdim=True)  # shape: (batchSize, 1)
         # TODO: remove clone. need update memory in backwards
-        # TODO (silvio):    iterate over classes instead of over samples? use indexing, but need to change labels.
-        #                   probably it wouldn't get much faster though
         l_neg = []
-
-        # for sample, label in zip(q, q_labels):
-        #     l_neg.append(torch.mm(sample.unsqueeze(0), self.memory[self.labels != label].clone().detach().t()))
 
         tmp_mem = self.memory.clone().detach()
         for sample, label in zip(q, q_labels):
             l_neg.append(torch.mm(sample.unsqueeze(0), tmp_mem[self.labels != label].t()))
 
-        # self.min_hist.append(min([e.shape[1] for e in l_neg]))
-        # if len(self.min_hist)>=100:
-        #     self.min_hist = self.min_hist[90:]
-        # print("min_hist: {}".format(sum(self.min_hist)/len(self.min_hist)))
-        #
         l_neg = [e[:, :min([e.shape[1] for e in l_neg])] for e in l_neg]
         l_neg = torch.cat(l_neg, dim=0)
         out = torch.cat((l_pos, l_neg), dim=1)
         out = torch.div(out, self.temperature).contiguous()
 
         # update memories
-        # print("DBG queues")
         with torch.no_grad():
             all_size = k_all.shape[0]
             out_ids = torch.fmod(torch.arange(all_size, dtype=torch.long).cuda() + self.index, self.queue_size)
@@ -92,6 +83,43 @@ class ClassOracleMemoryMoCo(MemoryMoCo):
             self.index = (self.index + all_size) % self.queue_size
 
         return out
+
+
+class MoCoNet(nn.Module):
+    def __init__(self, momentum, *args, **kwargs):
+        super().__init__()
+        self.contrast = MemoryMoCo(*args, **kwargs).cuda()
+        self.model = ResNet18().cuda()
+        self.model_ema = ResNet18().cuda()
+        moment_update(self.model, self.model_ema, 0)
+        self.momentum = momentum
+
+    def train(self, mode=True):
+        super().train(mode)
+
+        def set_bn_train_helper(m):
+            classname = m.__class__.__name__
+            if classname.find('BatchNorm') != -1:
+                m.train()
+
+        self.model_ema.eval()
+        self.model_ema.apply(set_bn_train_helper)
+
+        return self
+
+    def forward(self, x1, x2):
+        feat_q = self.model(x1)
+        with torch.no_grad():
+            feat_k = self.model_ema(x2)
+
+        if self.training:
+            scores = self.contrast(feat_q, feat_k, feat_k)
+        else:
+            scores = self.contrast.forward_eval(feat_q, feat_k)
+        return scores
+
+    def momentum_update(self):
+        moment_update(self.model, self.model_ema, self.momentum)
 
 
 # class ClassOracleMemoryMoCoOLD(MemoryMoCo):

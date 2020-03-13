@@ -27,8 +27,10 @@ from lib.augment.autoaugment_extra import CIFAR10Policy
 
 from lib.NCE import MemoryMoCo, NCESoftmaxLoss, ClassOracleMemoryMoCo
 from lib.dataset import ImageFolderInstance
-#from lib.models.resnet import resnet50
-from lib.models.resnet_cifar import ResNet18
+
+# from lib.models.resnet_cifar import ResNet18
+from lib.NCE.Contrast import MoCoNet
+
 from lib.models.wrn import wrn
 from lib.util import adjust_learning_rate, AverageMeter, check_dir, DistributedShufle, set_bn_train, moment_update
 
@@ -192,63 +194,6 @@ train_transform = TransformTwice(train_transform, train_transform)
 val_transform = TransformTwice(val_transform, val_transform)
 
 
-# def get_ood_loaders(args):
-#     train_transform = transforms.Compose([transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
-#                                           transforms.RandomHorizontalFlip(),
-#                                           transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.2)], p=0.8),
-#                                           transforms.RandomGrayscale(p=0.25),
-#                                           transforms.ToTensor(),
-#                                           transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-#                                                                std=[0.2471, 0.2435, 0.2616])])
-#     val_transform = transforms.Compose([transforms.ToTensor(),
-#                                         transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-#                                                              std=[0.2471, 0.2435, 0.2616])])
-#
-#     train_transform = TransformTwice(train_transform, train_transform)
-#     val_transform = TransformTwice(val_transform, val_transform)
-#
-#     if args.dataset == 'svhn':
-#         from torchvision.datasets import CIFAR10, SVHN
-#         train_in_data = CIFAR10('./data', train=True, transform=train_transform, download=True)
-#         val_in_data = CIFAR10('./data', train=False, transform=val_transform, download=True)
-#         val_out_data = SVHN('./data', split='test', transform=val_transform, download=True)
-#
-#     elif 'cifar10_' in args.dataset:
-#         if args.dataset == "cifar10_animals":
-#             positive_classes = [2, 3, 4, 5, 6, 7]
-#         else:
-#             positive_classes = [int(d) for d in args.dataset.replace('cifar10_', '')]
-#         negative_classes = [c for c in list(range(10)) if c not in positive_classes]
-#         train_in_data = CIFAR10ClassSelect(root='./data', positive_classes=positive_classes, train=True,
-#                                            download=False, transform=train_transform)
-#         val_in_data = CIFAR10ClassSelect(root='./data', positive_classes=positive_classes, train=False,
-#                                          download=False, transform=val_transform)
-#         val_out_data = CIFAR10ClassSelect(root='./data', positive_classes=negative_classes, train=False,
-#                                           download=False, transform=val_transform)
-#     else:
-#         raise NotImplementedError
-#
-#     train_sampler = torch.utils.data.distributed.DistributedSampler(train_in_data)
-#     train_loader = torch.utils.data.DataLoader(
-#         train_in_data, batch_size=args.batch_size, shuffle=False,
-#         num_workers=args.num_workers, pin_memory=True,
-#         sampler=train_sampler, drop_last=True)
-#
-#     in_val_sampler = torch.utils.data.distributed.DistributedSampler(val_in_data)
-#     in_val_loader = torch.utils.data.DataLoader(
-#         val_in_data, batch_size=64, shuffle=False,
-#         num_workers=args.num_workers, pin_memory=True,
-#         sampler=in_val_sampler, drop_last=True)
-#
-#     out_val_sampler = torch.utils.data.distributed.DistributedSampler(val_out_data)
-#     out_val_loader = torch.utils.data.DataLoader(
-#         val_out_data, batch_size=64, shuffle=False,
-#         num_workers=args.num_workers, pin_memory=True,
-#         sampler=out_val_sampler, drop_last=True)
-#
-#     return train_loader, in_val_loader, out_val_loader
-
-
 def get_ood_loaders(args):
     # train_transform = transforms.Compose([transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
     #                                       transforms.RandomHorizontalFlip(),
@@ -312,19 +257,6 @@ def get_ood_loaders(args):
     return train_loader, in_val_loader, out_val_loader
 
 
-def build_model(args):
-    from torchvision.models.resnet import resnet18
-    model = ResNet18().cuda()
-    model_ema = ResNet18().cuda()
-    # model = resnet18(pretrained=False, num_classes=128).cuda()
-    # model_ema = resnet18(pretrained=False, num_classes=128).cuda()
-
-    # copy weights from `model' to `model_ema'
-    moment_update(model, model_ema, 0)
-
-    return model, model_ema
-
-
 def load_checkpoint(args, model, model_ema, contrast, optimizer):
     if args.local_rank == 0:
         print("=> loading checkpoint '{}'".format(args.resume))
@@ -346,13 +278,11 @@ def load_checkpoint(args, model, model_ema, contrast, optimizer):
     torch.distributed.barrier()
 
 
-def save_checkpoint(args, epoch, model, model_ema, contrast, optimizer):
+def save_checkpoint(args, epoch, model, optimizer):
     print('==> Saving...')
     state = {
         'opt': args,
         'model': model.state_dict(),
-        'model_ema': model_ema.state_dict(),
-        'contrast': contrast.state_dict(),
         'optimizer': optimizer.state_dict(),
         'epoch': epoch,
     }
@@ -370,24 +300,22 @@ def main(args):
     if args.local_rank == 0:
         print(f"length of training dataset: {n_data}")
 
-    model, model_ema = build_model(args)
-    if not args.class_oracle:
-        contrast = MemoryMoCo(128, args.nce_k, args.nce_t).cuda()
-    else:
-        contrast = ClassOracleMemoryMoCo(10, 128, args.nce_k, args.nce_t).cuda()
+    model = MoCoNet(args.alpha, 128, args.nce_k, temperature=args.nce_t)
     criterion = NCESoftmaxLoss().cuda()
     optimizer = torch.optim.SGD(model.parameters(),
                                 lr=args.learning_rate,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay) 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs*(n_data/args.batch_size), eta_min=0.0001)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs*(n_data/args.batch_size),
+                                                           eta_min=0.0001)
 
-    model = DistributedDataParallel(model, device_ids=[args.local_rank], broadcast_buffers=False)
+    model = DistributedDataParallel(model, device_ids=[args.local_rank],
+                                    broadcast_buffers=False, find_unused_parameters=True)
 
     # optionally resume from a checkpoint
     if args.resume:
         assert os.path.isfile(args.resume)
-        load_checkpoint(args, model, model_ema, contrast, optimizer)
+        load_checkpoint(args, model, optimizer)
 
     # tensorboard
     logger = tb_logger.Logger(logdir=args.tb_folder, flush_secs=2)
@@ -398,11 +326,11 @@ def main(args):
         #adjust_learning_rate(epoch, args, optimizer)
         
         if epoch == 1:    
-            save_checkpoint(args, epoch, model, model_ema, contrast, optimizer)
+            save_checkpoint(args, epoch, model, optimizer)
 
         tic = time.time()
-        prob_in, prob_out, auroc = val_ood(epoch, in_val_loader, out_val_loader, model, model_ema, contrast, criterion, args)
-        loss, prob = train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optimizer, scheduler, args)
+        prob_in, prob_out, auroc = val_ood(epoch, in_val_loader, out_val_loader, model, criterion, args)
+        loss, prob = train_moco(epoch, train_loader, model, criterion, optimizer, scheduler, args)
 
         if args.local_rank == 0:
             print('epoch {}, total time {:.2f}'.format(epoch, time.time() - tic))
@@ -416,15 +344,15 @@ def main(args):
             logger.log_value('auroc', auroc, epoch)
 
             # save model
-            save_checkpoint(args, epoch, model, model_ema, contrast, optimizer)
+            save_checkpoint(args, epoch, model, optimizer)
 
 
-def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optimizer, scheduler, args):
+def train_moco(epoch, train_loader, model, criterion, optimizer, scheduler, args):
     """
     one epoch training for moco
     """
     model.train()
-    set_bn_train(model_ema)
+    # set_bn_train(model_ema)
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -435,29 +363,18 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
     for idx, ((x1, x2), l) in enumerate(train_loader):
         data_time.update(time.time() - end)
 
-        #bsz = inputs.size(0)
         bsz = x1.size(0)
 
         # forward
-        #x1, x2 = torch.split(inputs, [3, 3], dim=1)
         x1.contiguous()
         x2.contiguous()
         x1 = x1.cuda(non_blocking=True)
         x2 = x2.cuda(non_blocking=True)
 
-        feat_q = model(x1)
-        with torch.no_grad():
-            x2_shuffled, backward_inds = DistributedShufle.forward_shuffle(x2, epoch)
-            feat_k = model_ema(x2_shuffled)
-            feat_k_all, feat_k = DistributedShufle.backward_shuffle(feat_k, backward_inds, return_local=True)
+        out = model(x1, x2)
 
-        #print ('feat_k: ', feat_k.size(), ' feat_k_all: ', feat_k_all.size(), ' feat_q: ',  feat_q.size())
-        if args.class_oracle:
-            out = contrast(feat_q, feat_k, feat_k_all, l)
-        else:
-            out = contrast(feat_q, feat_k, feat_k_all)
         loss = criterion(out)
-        prob = F.softmax(out, dim=1)[:, 0].mean()
+        prob = F.softmax(out, dim=1)[:, 0].mean()  # TODO bring this to the MoCo class?
 
         # backward
         optimizer.zero_grad()
@@ -465,7 +382,7 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
         optimizer.step()
         scheduler.step()
 
-        moment_update(model, model_ema, args.alpha)
+        model.module.momentum_update()
 
         # update meters
         loss_meter.update(loss.item(), bsz)
@@ -484,10 +401,9 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
     return loss_meter.avg, prob_meter.avg
 
 
-def val_ood(epoch, in_loader, out_loader, model, model_ema, contrast, criterion, args):
+def val_ood(epoch, in_loader, out_loader, model, criterion, args):
     print("Validating epoch {}".format(epoch))
     model.eval()
-    model_ema.eval()
 
     iters = {'in': iter(in_loader), 'out': iter(out_loader)}
     prob_meters = {k: AverageMeter() for k in iters.keys()}
@@ -504,14 +420,16 @@ def val_ood(epoch, in_loader, out_loader, model, model_ema, contrast, criterion,
             x1 = x1.cuda(non_blocking=True)
             x2 = x2.cuda(non_blocking=True)
 
+            # with torch.no_grad():
+            #     feat_q = model(x1)
+            #     feat_k = model_ema(x2)
+            #
+            # if args.class_oracle:
+            #     raise NotImplementedError
+            # else:
+            #     out = contrast.forward_eval(feat_q, feat_k)
             with torch.no_grad():
-                feat_q = model(x1)
-                feat_k = model_ema(x2)
-
-            if args.class_oracle:
-                raise NotImplementedError
-            else:
-                out = contrast.forward_eval(feat_q, feat_k)
+                out = model(x1, x2)
             loss = criterion(out)
             prob = F.softmax(out, dim=1)[:, 0].flatten().cpu().numpy()
             probs[data_dist].append(prob)
@@ -539,3 +457,61 @@ if __name__ == '__main__':
     cudnn.benchmark = True
 
     main(opt)
+
+
+# # *** CODE GRAVEYARD ***
+# def get_ood_loaders(args):
+#     train_transform = transforms.Compose([transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
+#                                           transforms.RandomHorizontalFlip(),
+#                                           transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.2)], p=0.8),
+#                                           transforms.RandomGrayscale(p=0.25),
+#                                           transforms.ToTensor(),
+#                                           transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+#                                                                std=[0.2471, 0.2435, 0.2616])])
+#     val_transform = transforms.Compose([transforms.ToTensor(),
+#                                         transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+#                                                              std=[0.2471, 0.2435, 0.2616])])
+#
+#     train_transform = TransformTwice(train_transform, train_transform)
+#     val_transform = TransformTwice(val_transform, val_transform)
+#
+#     if args.dataset == 'svhn':
+#         from torchvision.datasets import CIFAR10, SVHN
+#         train_in_data = CIFAR10('./data', train=True, transform=train_transform, download=True)
+#         val_in_data = CIFAR10('./data', train=False, transform=val_transform, download=True)
+#         val_out_data = SVHN('./data', split='test', transform=val_transform, download=True)
+#
+#     elif 'cifar10_' in args.dataset:
+#         if args.dataset == "cifar10_animals":
+#             positive_classes = [2, 3, 4, 5, 6, 7]
+#         else:
+#             positive_classes = [int(d) for d in args.dataset.replace('cifar10_', '')]
+#         negative_classes = [c for c in list(range(10)) if c not in positive_classes]
+#         train_in_data = CIFAR10ClassSelect(root='./data', positive_classes=positive_classes, train=True,
+#                                            download=False, transform=train_transform)
+#         val_in_data = CIFAR10ClassSelect(root='./data', positive_classes=positive_classes, train=False,
+#                                          download=False, transform=val_transform)
+#         val_out_data = CIFAR10ClassSelect(root='./data', positive_classes=negative_classes, train=False,
+#                                           download=False, transform=val_transform)
+#     else:
+#         raise NotImplementedError
+#
+#     train_sampler = torch.utils.data.distributed.DistributedSampler(train_in_data)
+#     train_loader = torch.utils.data.DataLoader(
+#         train_in_data, batch_size=args.batch_size, shuffle=False,
+#         num_workers=args.num_workers, pin_memory=True,
+#         sampler=train_sampler, drop_last=True)
+#
+#     in_val_sampler = torch.utils.data.distributed.DistributedSampler(val_in_data)
+#     in_val_loader = torch.utils.data.DataLoader(
+#         val_in_data, batch_size=64, shuffle=False,
+#         num_workers=args.num_workers, pin_memory=True,
+#         sampler=in_val_sampler, drop_last=True)
+#
+#     out_val_sampler = torch.utils.data.distributed.DistributedSampler(val_out_data)
+#     out_val_loader = torch.utils.data.DataLoader(
+#         val_out_data, batch_size=64, shuffle=False,
+#         num_workers=args.num_workers, pin_memory=True,
+#         sampler=out_val_sampler, drop_last=True)
+#
+#     return train_loader, in_val_loader, out_val_loader
