@@ -17,38 +17,43 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
-from torchvision import transforms
-from torchvision.datasets import CIFAR10, SVHN
-import torchvision.transforms.functional as TF
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import datasets
 import random
 
 from lib.augment.cutout import Cutout
 from lib.augment.autoaugment_extra import CIFAR10Policy
 
 from lib.NCE import MemoryMoCo, NCESoftmaxLoss, ClassOracleMemoryMoCo
-from lib.dataset import ImageFolderInstance
-
-# from lib.models.resnet_cifar import ResNet18
 from lib.NCE.Contrast import MoCoNet
 
 from lib.models.wrn import wrn
 from lib.util import adjust_learning_rate, AverageMeter, check_dir, DistributedShufle, set_bn_train, moment_update
-
-from anomaly_tools.data.images.cifar10 import CIFAR10ClassSelect
 from sklearn.metrics import roc_auc_score
 
+from lib.data import train_transform, rescale_images
+
+global_step = 0
+data_root = "/misc/lmbraid19/galessos/datasets/"
+
+
 def parse_option():
-    parser = argparse.ArgumentParser('argument for training', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser('arguments for training', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    # task
+    parser.add_argument('dataset', type=str)
+
     # exp name
     parser.add_argument('--exp-name', type=str, default='exp',
                         help='experiment name, used to determine checkpoint/tensorboard dir')
 
     # optimization
     parser.add_argument('--learning-rate', '--lr', type=float, default=0.01, help='learning rate')
+    parser.add_argument('--batch-size', '--bs', type=int, default=32, help='batch_size')
     parser.add_argument('--lr-decay-epochs', type=int, default=[120, 160, 200], nargs='+',
                         help='where to decay lr, can be a list')
     parser.add_argument('--lr-decay-rate', type=float, default=0.1, help='decay rate for learning rate')
-    parser.add_argument('--weight-decay', type=float, default=5e-4, help='weight decay')
+    parser.add_argument('--weight-decay', '--wd', type=float, default=5e-4, help='weight decay')
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum for SGD')
 
     # root folders
@@ -58,7 +63,6 @@ def parse_option():
                         help='root directory for output')
 
     # dataset
-    parser.add_argument('--dataset', type=str, default='cifar10_357')
     parser.add_argument('--crop', type=float, default=0.2, help='minimum crop')
     parser.add_argument('--aug', type=str, default='CJ', choices=['NULL', 'CJ'])
 
@@ -72,7 +76,7 @@ def parse_option():
     parser.add_argument('--alpha', type=float, default=0.999, help='exponential moving average weight')
 
     # loss function
-    parser.add_argument('--nce-k', type=int, default=4096)
+    parser.add_argument('--nce-k', type=int, default=2048)
     parser.add_argument('--nce-t', type=float, default=0.3)
     parser.add_argument('--class-oracle', action="store_true")
 
@@ -80,9 +84,8 @@ def parse_option():
     parser.add_argument('--print-freq', type=int, default=10, help='print frequency')
     parser.add_argument('--tb-freq', type=int, default=500, help='tb frequency')
     parser.add_argument('--save-freq', type=int, default=10, help='save frequency')
-    parser.add_argument('--batch-size', type=int, default=32, help='batch_size')
     parser.add_argument('--num-workers', type=int, default=8, help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=200, help='number of training epochs')
+    parser.add_argument('--epochs', type=int, default=1000, help='number of training epochs')
     parser.add_argument('--start-epoch', type=int, default=1, help='used for resume')
     parser.add_argument("--local_rank", type=int)
 
@@ -96,143 +99,22 @@ def parse_option():
     return args
 
 
-class MyRotationTransform:
-    """Rotate by one of the given angles."""
-
-    def __init__(self, angles):
-        self.angles = angles
-
-    def __call__(self, x):
-        angle = random.choice(self.angles)
-        return TF.rotate(x, angle)
-
-
-class TransformTwice:
-    def __init__(self, transform, aug_transform):
-        self.transform = transform
-        self.aug_transform = aug_transform
-
-    def __call__(self, inp):
-        out1 = self.transform(inp)
-        out2 = self.aug_transform(inp)
-        return out1, out2
-
-
-class RandomTranslateWithReflect:
-    '''
-    Translate image randomly
-    Translate vertically and horizontally by n pixels where
-    n is integer drawn uniformly independently for each axis
-    from [-max_translation, max_translation].
-    Fill the uncovered blank area with reflect padding.
-    '''
-
-    def __init__(self, max_translation):
-        self.max_translation = max_translation
-
-    def __call__(self, old_image):
-        xtranslation, ytranslation = np.random.randint(-self.max_translation,
-                                                       self.max_translation + 1,
-                                                       size=2)
-        xpad, ypad = abs(xtranslation), abs(ytranslation)
-        xsize, ysize = old_image.size
-
-        flipped_lr = old_image.transpose(Image.FLIP_LEFT_RIGHT)
-        flipped_tb = old_image.transpose(Image.FLIP_TOP_BOTTOM)
-        flipped_both = old_image.transpose(Image.ROTATE_180)
-
-        new_image = Image.new("RGB", (xsize + 2 * xpad, ysize + 2 * ypad))
-
-        new_image.paste(old_image, (xpad, ypad))
-
-        new_image.paste(flipped_lr, (xpad + xsize - 1, ypad))
-        new_image.paste(flipped_lr, (xpad - xsize + 1, ypad))
-
-        new_image.paste(flipped_tb, (xpad, ypad + ysize - 1))
-        new_image.paste(flipped_tb, (xpad, ypad - ysize + 1))
-
-        new_image.paste(flipped_both, (xpad - xsize + 1, ypad - ysize + 1))
-        new_image.paste(flipped_both, (xpad + xsize - 1, ypad - ysize + 1))
-        new_image.paste(flipped_both, (xpad - xsize + 1, ypad + ysize - 1))
-        new_image.paste(flipped_both, (xpad + xsize - 1, ypad + ysize - 1))
-
-        new_image = new_image.crop((xpad - xtranslation,
-                                    ypad - ytranslation,
-                                    xpad + xsize - xtranslation,
-                                    ypad + ysize - ytranslation))
-        return new_image
-
-
-def get_cifar_ids(dataset, classes, name):
-    idsfile = "{}.csv".format(name)
-    if not os.path.isfile(idsfile):
-        print("Finding indices for "+name+"...")
-        ids = [i for i, (_, l) in enumerate(dataset) if l in classes]
-        # write ids to json for future use and return
-        with open(idsfile, "w") as jsf:
-            json.dump(ids, jsf)
-        return ids
-    # load json
-    print("Found indices for " + name + ", loading...")
-    with open(idsfile) as jsf:
-        ids = json.load(jsf)
-    return ids
-
-
-train_transform = transforms.Compose([transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
-                                      transforms.RandomHorizontalFlip(),
-                                      transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.2)], p=0.8),
-                                      transforms.RandomGrayscale(p=0.25),
-                                      transforms.ToTensor(),
-                                      transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-                                                           std=[0.2471, 0.2435, 0.2616])])
-val_transform = transforms.Compose([transforms.ToTensor(),
-                                    transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-                                                         std=[0.2471, 0.2435, 0.2616])])
-
-train_transform = TransformTwice(train_transform, train_transform)
-val_transform = TransformTwice(val_transform, val_transform)
-
-
-def get_ood_loaders(args):
-    # train_transform = transforms.Compose([transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
-    #                                       transforms.RandomHorizontalFlip(),
-    #                                       transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.2)], p=0.8),
-    #                                       transforms.RandomGrayscale(p=0.25),
-    #                                       transforms.Resize(64),
-    #                                       transforms.ToTensor(),
-    #                                       transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-    #                                                            std=[0.2471, 0.2435, 0.2616])])
-    # val_transform = transforms.Compose([transforms.Resize(64),
-    #                                     transforms.ToTensor(),
-    #                                     transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-    #                                                          std=[0.2471, 0.2435, 0.2616])])
-
-    # train_transform = TransformTwice(train_transform, train_transform)
-    # val_transform = TransformTwice(val_transform, val_transform)
-
-    if args.dataset == 'svhn':
-        train_in_data = CIFAR10('./tmp_datasets', train=True, transform=train_transform, download=True)
-        val_in_data = CIFAR10('./tmp_datasets', train=False, transform=val_transform, download=True)
-        val_out_data = SVHN('./tmp_datasets', split='test', transform=val_transform, download=True)
-
-    elif 'cifar10_' in args.dataset:
-        train_dataset = CIFAR10('./tmp_datasets', train=True, transform=train_transform, download=True)
-        val_dataset = CIFAR10('./tmp_datasets', train=False, transform=val_transform, download=True)
-        if args.dataset == "cifar10_animals":
-            positive_classes = [2, 3, 4, 5, 6, 7]
-        else:
-            positive_classes = [int(d) for d in args.dataset.replace('cifar10_', '')]
-        negative_classes = [c for c in list(range(10)) if c not in positive_classes]
-
-        train_ids = get_cifar_ids(train_dataset, positive_classes, args.dataset+"_train_in")
-        val_in_ids = get_cifar_ids(val_dataset, positive_classes, args.dataset+"_val_in")
-        val_out_ids = get_cifar_ids(val_dataset, negative_classes, args.dataset+"_val_out")
-
-        train_in_data = torch.utils.data.Subset(train_dataset, train_ids)
-        val_in_data = torch.utils.data.Subset(val_dataset, val_in_ids)
-        val_out_data = torch.utils.data.Subset(val_dataset, val_out_ids)
-
+def get_train_loader(args):
+    import re
+    if args.dataset.lower() == "cifar10":
+        train_in_data = datasets.CIFAR10(data_root, train=True, transform=train_transform, download=True)
+    elif args.dataset.lower() == "cifar100":
+        train_in_data = datasets.CIFAR100(data_root, train=True, transform=train_transform, download=True)
+    elif re.match("^cifar10_([0-9]+)$", args.dataset):
+        classes = re.match("^cifar10_([0-9]+)$", args.dataset)[1]
+        classes = [int(c) for c in classes]
+        dataset = datasets.CIFAR10(data_root, train=True, transform=train_transform, download=True)
+        train_in_data = torch.utils.data.Subset(dataset, [i for i, (_, l) in enumerate(dataset) if l in classes])
+    elif re.match("^cifar80-20_set([0-9]+)$", args.dataset):
+        with open(os.path.join(data_root, "cifar80-20", "{}.json".format(args.dataset)), "r") as set_file:
+            classes = json.load(set_file)['cifar80']
+        dataset = datasets.CIFAR100(data_root, train=True, transform=train_transform, download=True)
+        train_in_data = torch.utils.data.Subset(dataset, [i for i, (_, l) in enumerate(dataset) if l in classes])
     else:
         raise NotImplementedError
 
@@ -241,20 +123,7 @@ def get_ood_loaders(args):
         train_in_data, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
         sampler=train_sampler, drop_last=True)
-
-    in_val_sampler = torch.utils.data.distributed.DistributedSampler(val_in_data)
-    in_val_loader = torch.utils.data.DataLoader(
-        val_in_data, batch_size=64, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
-        sampler=in_val_sampler, drop_last=True)
-
-    out_val_sampler = torch.utils.data.distributed.DistributedSampler(val_out_data)
-    out_val_loader = torch.utils.data.DataLoader(
-        val_out_data, batch_size=64, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
-        sampler=out_val_sampler, drop_last=True)
-
-    return train_loader, in_val_loader, out_val_loader
+    return train_loader
 
 
 def load_checkpoint(args, model, model_ema, contrast, optimizer):
@@ -295,7 +164,8 @@ def save_checkpoint(args, epoch, model, optimizer):
 
 
 def main(args):
-    train_loader, in_val_loader, out_val_loader = get_ood_loaders(args)
+    # train_loader, in_val_loader, out_val_loaders = get_ood_loaders(args)
+    train_loader = get_train_loader(args)
     n_data = len(train_loader.dataset)
     if args.local_rank == 0:
         print(f"length of training dataset: {n_data}")
@@ -318,7 +188,7 @@ def main(args):
         load_checkpoint(args, model, optimizer)
 
     # tensorboard
-    logger = tb_logger.Logger(logdir=args.tb_folder, flush_secs=2)
+    log = SummaryWriter(args.tb_folder, flush_secs=2)
 
     # routine
     for epoch in range(args.start_epoch, args.epochs + 1):
@@ -329,28 +199,29 @@ def main(args):
             save_checkpoint(args, epoch, model, optimizer)
 
         tic = time.time()
-        prob_in, prob_out, auroc = val_ood(epoch, in_val_loader, out_val_loader, model, criterion, args)
-        loss, prob = train_moco(epoch, train_loader, model, criterion, optimizer, scheduler, args)
+        # prob_in, prob_out, auroc = val_ood(epoch, in_val_loader, out_val_loaders, model, criterion, args, log=log)
+        loss, prob = train_moco(epoch, train_loader, model, criterion, optimizer, scheduler, args, log=log)
 
         if args.local_rank == 0:
             print('epoch {}, total time {:.2f}'.format(epoch, time.time() - tic))
 
             # tensorboard logger
-            logger.log_value('ins_loss', loss, epoch)
-            logger.log_value('ins_prob', prob, epoch)
-            logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
-            logger.log_value('val_prob_in', prob_in, epoch)
-            logger.log_value('val_prob_out', prob_out, epoch)
-            logger.log_value('auroc', auroc, epoch)
+            log.add_scalar('ins_loss', loss, epoch)
+            log.add_scalar('ins_prob', prob, epoch)
+            log.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
+            # log.add_scalar('val_prob_in', prob_in, epoch)
+            # log.add_scalar('val_prob_out', prob_out, epoch)
+            # log.add_scalar('auroc', auroc, epoch)
 
             # save model
             save_checkpoint(args, epoch, model, optimizer)
 
 
-def train_moco(epoch, train_loader, model, criterion, optimizer, scheduler, args):
+def train_moco(epoch, train_loader, model, criterion, optimizer, scheduler, args, log=None):
     """
     one epoch training for moco
     """
+    global global_step
     model.train()
     # set_bn_train(model_ema)
 
@@ -398,52 +269,12 @@ def train_moco(epoch, train_loader, model, criterion, optimizer, scheduler, args
                   f'loss {loss_meter.val:.3f} ({loss_meter.avg:.3f})\t'
                   f'prob {prob_meter.val:.3f} ({prob_meter.avg:.3f})')
 
+            log.add_images('training_samples_x1', rescale_images(x1), global_step)
+            log.add_images('training_samples_x2', rescale_images(x2), global_step)
+
+        global_step += 1
+
     return loss_meter.avg, prob_meter.avg
-
-
-def val_ood(epoch, in_loader, out_loader, model, criterion, args):
-    print("Validating epoch {}".format(epoch))
-    model.eval()
-
-    iters = {'in': iter(in_loader), 'out': iter(out_loader)}
-    prob_meters = {k: AverageMeter() for k in iters.keys()}
-    probs = {k: [] for k in iters.keys()}
-
-    for data_dist in iters.keys():
-        print("*** DATA DIST = {}".format(data_dist))
-        for idx, ((x1, x2), l) in enumerate(iters[data_dist]):
-            bsz = x1.size(0)
-
-            # forward
-            x1.contiguous()
-            x2.contiguous()
-            x1 = x1.cuda(non_blocking=True)
-            x2 = x2.cuda(non_blocking=True)
-
-            # with torch.no_grad():
-            #     feat_q = model(x1)
-            #     feat_k = model_ema(x2)
-            #
-            # if args.class_oracle:
-            #     raise NotImplementedError
-            # else:
-            #     out = contrast.forward_eval(feat_q, feat_k)
-            with torch.no_grad():
-                out = model(x1, x2)
-            loss = criterion(out)
-            prob = F.softmax(out, dim=1)[:, 0].flatten().cpu().numpy()
-            probs[data_dist].append(prob)
-            prob_meters[data_dist].update(prob.mean())
-
-        print("avg prob {}: {}".format(data_dist, prob_meters[data_dist].avg))
-
-    probs = {k: np.concatenate(p, axis=0) for k, p in probs.items()}
-    labels = [1 for _ in probs['in']] + [0 for _ in probs['out']]
-    probs = np.concatenate([probs['in'], probs['out']], axis=0)
-    auroc = roc_auc_score(labels, probs)
-    print("AUROC = {}".format(auroc))
-
-    return prob_meters['in'].avg, prob_meters['out'].avg, auroc
 
 
 if __name__ == '__main__':

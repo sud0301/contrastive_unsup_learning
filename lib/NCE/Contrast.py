@@ -4,6 +4,7 @@ import math
 from ..models.resnet_cifar import ResNet18
 from ..util import moment_update
 
+from time import time
 
 class MemoryMoCo(nn.Module):
     """Fixed-size queue with momentum encoder"""
@@ -47,6 +48,12 @@ class MemoryMoCo(nn.Module):
         out = torch.cat((l_pos, l_neg), dim=1)
         out = torch.div(out, self.temperature).contiguous()
         return out
+
+    # def forward_eval(self, query, noise):
+    #     logits = torch.mm(query.detach(), noise.detach().t())  # at position 0 is the query
+    #     assert logits.shape[0] == 1 and logits.shape[1] == noise.shape[0]
+    #     out = torch.div(logits, self.temperature).contiguous()
+    #     return out
 
 
 class ClassOracleMemoryMoCo(MemoryMoCo):
