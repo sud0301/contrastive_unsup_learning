@@ -28,6 +28,20 @@ class TransformTwice:
         return out1, out2
 
 
+class TransformNTimes:
+    def __init__(self, transform, n):
+        self.transform = transform
+        self.n = n
+
+    def __call__(self, x):
+        assert x.shape[0] == 1
+        outputs = []
+        for _ in range(self.n):
+            outputs.append(self.transform(x))
+
+        return outputs
+
+
 class Unnormalize(object):
     def __init__(self, mean, std):
         self.mean = torch.as_tensor(mean).cuda()
@@ -85,19 +99,21 @@ class RandomTranslateWithReflect:
         return new_image
 
 
-train_transform = transforms.Compose([transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
+train_transform_single = transforms.Compose([transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
                                       transforms.RandomHorizontalFlip(),
                                       transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.2)], p=0.8),
                                       transforms.RandomGrayscale(p=0.25),
                                       transforms.ToTensor(),
                                       transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
                                                            std=[0.2471, 0.2435, 0.2616])])
-val_transform = transforms.Compose([transforms.ToTensor(),
+val_transform_single = transforms.Compose([transforms.Resize(32),
+                                    transforms.ToTensor(),
                                     transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
                                                          std=[0.2471, 0.2435, 0.2616])])
 
-train_transform = TransformTwice(train_transform, train_transform)
-val_transform = TransformTwice(val_transform, val_transform)
+n_transform_train = TransformNTimes(train_transform_single, 70)
+train_transform = TransformTwice(train_transform_single, train_transform_single)
+val_transform = TransformTwice(val_transform_single, val_transform_single)
 
 rescale_images = Unnormalize(mean=[0.4914, 0.4822, 0.4465],
                              std=[0.2471, 0.2435, 0.2616])

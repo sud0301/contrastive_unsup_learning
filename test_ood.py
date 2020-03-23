@@ -13,7 +13,7 @@ from lib.NCE import NCESoftmaxLoss
 from lib.NCE.Contrast import MoCoNet
 from torch.utils.tensorboard import SummaryWriter
 from lib.util import AverageMeter, check_dir
-from lib.data import val_transform, rescale_images
+from lib.data import val_transform, rescale_images, train_transform, n_transform_train
 from sklearn.metrics import roc_auc_score, roc_curve
 from tqdm import tqdm
 
@@ -70,6 +70,9 @@ def parse_option():
 
 def get_val_loaders(args):
     # IN DATASET
+    # val_transform = train_transform
+    # val_transform = n_transform_train; assert args.batch_size == 1
+
     if args.in_dataset.lower() == "cifar10":
         val_in_data = datasets.CIFAR10(data_root, train=False, transform=val_transform, download=True)
     elif args.in_dataset.lower() == "cifar100":
@@ -176,11 +179,11 @@ def main(args):
             # dbg_ood(epoch, val_in_loader, val_out_loader, model, criterion, args, log=None, name=k)
 
             prob_in, prob_out, auroc, fpr_at_95tpr = val_ood(epoch, val_in_loader, val_out_loader, model, criterion, args, log=log, name=k)
+            print("AUROC = {:.5f}, FPR@95TPR = {:.5f}".format(auroc, fpr_at_95tpr))
             # log.add_scalar('val_prob_in_'+k, prob_in, epoch)
             # log.add_scalar('val_prob_out_'+k, prob_out, epoch)
             # log.add_scalar('AUROC_{}_{}'.format(k, epoch), auroc, epoch)
             # log.add_scalar('FPR@95TPR_{}'.format(k), fpr_at_95tpr, epoch)
-            print("AUROC = {:.5f}, FPR@95TPR = {:.5f}".format(auroc, fpr_at_95tpr))
 
 
 def dbg_ood(epoch, in_loader, out_loader, model, criterion, args, log=None, name=None):
@@ -190,8 +193,8 @@ def dbg_ood(epoch, in_loader, out_loader, model, criterion, args, log=None, name
     n = {'in': len(in_loader.dataset) / in_loader.batch_size,
          'out': len(out_loader.dataset) / out_loader.batch_size}
 
-    ood_batch = torch.stack([out_loader.dataset[i][0][0] for i in range(-args.batch_size, 0)], dim=0).cuda()
-    pos_batch = torch.stack([in_loader.dataset[i][0][0] for i in range(-args.batch_size, 0)], dim=0).cuda()
+    ood_batch = torch.stack([out_loader.dataset[i][0][0] for i in range(-512, 0)], dim=0).cuda()
+    pos_batch = torch.stack([in_loader.dataset[i][0][0] for i in range(-512, 0)], dim=0).cuda()
     bgs = {"in": pos_batch, "out": ood_batch}
 
     probs = dict()
@@ -202,19 +205,25 @@ def dbg_ood(epoch, in_loader, out_loader, model, criterion, args, log=None, name
 
     for data_dist in iters.keys():
         with tqdm(total=n[data_dist]) as t:
-            for idx, ((x1, _), _) in enumerate(iters[data_dist]):
+            for idx, ((x1, x2), _) in enumerate(iters[data_dist]):
                 if idx >= 1000:
                     break
                 # forward
                 x1.contiguous()
-                x1 = x1.cuda(non_blocking=True)
+                x2.contiguous()
+                x1 = x1[0:1].cuda(non_blocking=True)
+                x2 = x2[0:1].cuda(non_blocking=True)
 
                 for bg_k, bg_dist in bgs.items():
+                    # print(x1.shape)
+                    # print(bg_dist.shape)
+                    # print(torch.cat((x1, bg_dist), dim=0).shape)
                     with torch.no_grad():
-                        out = model(x1, bg_dist)
+                        out = model(x1, torch.cat((x2, bg_dist), dim=0))
 
                     # loss = criterion(out)
                     prob = F.softmax(out, dim=1)[:, 0].flatten().cpu().numpy()
+                    # prob = out[0, 0].flatten().cpu().numpy()
                     probs[data_dist][bg_k].append(prob)
                     # prob_meters["{}_{}".format(data_dist, bg_k)].update(prob.item())
 
@@ -232,7 +241,8 @@ def dbg_ood(epoch, in_loader, out_loader, model, criterion, args, log=None, name
     #         print(p2.shape)
     # probs = {k: np.concatenate(p, axis=0) for k, p in probs.items()}
 
-    for sets in ["in_out-out_out", "in_in-out_in", "in_in-out_out"]:
+    # for sets in ["in_out-out_out", "in_in-out_in", "in_in-out_out"]:
+    for sets in ["in_out-out_out", "in_in-out_in"]:
         in_set, out_set = sets.split('-')
         in_probs = probs[in_set.split('_')[0]][in_set.split('_')[1]]
         out_probs = probs[out_set.split('_')[0]][out_set.split('_')[1]]
@@ -258,9 +268,12 @@ def val_ood(epoch, in_loader, out_loader, model, criterion, args, log=None, name
     for data_dist in iters.keys():
         with tqdm(total=n[data_dist]) as t:
             for idx, ((x1, _), _) in enumerate(iters[data_dist]):
+            # for idx, (x1, _) in enumerate(iters[data_dist]):
                 if idx >= 1000:
                     break
                 # forward
+                # x1 = torch.cat(x1, dim=0)
+                # assert x1.shape[0] == 70
                 x1.contiguous()
                 x1 = x1.cuda(non_blocking=True)
 
