@@ -16,25 +16,26 @@ The following enverionments is tested:
 * The pre-training stage:
 
   ```
-  exp_name=MoCo/ddp/1-gpu_bs-32_shuffle_bn
+  exp_name=MoCo/ddp/cifar10_test
   python -m torch.distributed.launch --nproc_per_node=1 \
-      train.py \
+      train_cifar_no_dist.py \
       --batch-size 32 \
       --exp-name ${exp_name} \
-      --learning-rate 0.03 \
+      --learning-rate 0.01 \
       --nce-k 4096 \
       --nce-t 0.3 \
+      --epochs 500 \
       --weight-decay 5e-4
   ```
 
 * The linear evaluation stage:
 
   ```
-  exp_name=MoCo/ddp/1-gpu_bs-32_shuffle_bn
+  exp_name=MoCo/ddp/cifar10_test
   python -m torch.distributed.launch --nproc_per_node=1 \
-      eval.py \
+      eval_cifar_no_dist.py \
       --exp-name ${exp_name} \
-      --model-path ./output/imagenet/${exp_name}/models/current.pth \
+      --model-path ./output/cifar10/${exp_name}/models/current.pth \
       --batch-size 128 \
       --learning-rate 3 \
       --epochs 20 \
